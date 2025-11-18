@@ -1,0 +1,40 @@
+﻿# configs/datasets.yaml
+
+datasets:
+  - id: "natural_questions"
+    short_name: "NQ"
+    type: "single_hop"
+    description: "Real Google search queries with answers in Wikipedia; tests basic factual QA."
+    priority: "secondary"
+    train_path: "TO_BE_DECIDED"
+    eval_path: "TO_BE_DECIDED"
+
+  - id: "hotpotqa"
+    short_name: "HotpotQA"
+    type: "multi_hop"
+    description: "Wikipedia-based multi-hop QA requiring reasoning over multiple paragraphs."
+    priority: "core"
+    train_path: "TO_BE_DECIDED"
+    eval_path: "TO_BE_DECIDED"
+
+  - id: "popqa"
+    short_name: "PopQA"
+    type: "long_tail"
+    description: "Long-tail factual QA focusing on rare entities; good for RAG vs FT comparison."
+    priority: "core"
+    train_path: "TO_BE_DECIDED"
+    eval_path: "TO_BE_DECIDED"
+
+  - id: "pubmedqa"
+    short_name: "PubMedQA"
+    type: "domain_specific"
+    description: "Biomedical QA from PubMed; tests domain-specific reasoning."
+    priority: "optional"
+    train_path: "TO_BE_DECIDED"
+    eval_path: "TO_BE_DECIDED"
+
+defaults:
+  main_datasets:
+    - "hotpotqa"
+    - "popqa"
+  eval_samples_per_dataset: 500

@@ -1,0 +1,34 @@
+﻿# configs/models.yaml
+
+families:
+  - name: "Qwen3"
+    description: "Small open-source LLMs from Qwen, good for multilingual QA."
+    models:
+      - id: "qwen3-0.6b"
+        hf_name: "TO_BE_DECIDED_QWEN_0.6B"
+        params_billion: 0.6
+        recommended: false
+      - id: "qwen3-1.7b"
+        hf_name: "TO_BE_DECIDED_QWEN_1.7B"
+        params_billion: 1.7
+        recommended: true
+
+  - name: "Gemma3"
+    description: "Lightweight LLMs from Google DeepMind, optimized for efficiency."
+    models:
+      - id: "gemma3-270m"
+        hf_name: "TO_BE_DECIDED_GEMMA_270M"
+        params_billion: 0.27
+        recommended: false
+      - id: "gemma3-1b"
+        hf_name: "TO_BE_DECIDED_GEMMA_1B"
+        params_billion: 1.0
+        recommended: true
+
+defaults:
+  # For our cost–performance experiments, we will usually pick **one main model**.
+  base_model_id: "qwen3-1.7b"   # or "gemma3-1b" → to be decided with Ryo
+  dtype: "bfloat16"
+  max_input_tokens: 2048
+  max_output_tokens: 256
+  device: "cuda"

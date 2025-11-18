@@ -1,0 +1,15 @@
+﻿# configs/train.yaml
+
+training:
+  num_epochs: 1              # start with 1 epoch for experiments
+  batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-4
+  max_grad_norm: 1.0
+
+lora:
+  enabled: true
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules: ["q_proj", "v_proj"]
