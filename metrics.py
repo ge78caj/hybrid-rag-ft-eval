@@ -2,7 +2,6 @@
 import csv
 import math
 import os
-import time
 from typing import List, Dict, Any, Optional
 
 
@@ -200,7 +199,10 @@ def save_metrics_json(metrics: Dict[str, Any], path: str) -> None:
     """
     Save metrics as a JSON file.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
+
     with open(path, "w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2, ensure_ascii=False)
 
@@ -209,9 +211,11 @@ def save_metrics_csv(metrics: Dict[str, Any], path: str) -> None:
     """
     Save metrics as a single-row CSV file.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fieldnames = list(metrics.keys())
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
 
+    fieldnames = list(metrics.keys())
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
