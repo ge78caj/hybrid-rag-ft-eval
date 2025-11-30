@@ -1,0 +1,17 @@
+{
+  "em": 0.03666666666666667,
+  "f1": 0.1672033799247421,
+  "latency_avg_ms": 1376.7061289151509,
+  "latency_p95_ms": 2649.5118141174316,
+  "throughput_qps": 0.7263714303269669,
+  "peak_vram_mb": 1485.93896484375,
+  "params_total_m": 0,
+  "params_trainable_m": 0,
+  "storage_model_mb": 0,
+  "storage_adapters_mb": 0,
+  "storage_index_mb": 0,
+  "train_gpu_hours": 0,
+  "num_gpus": 1,
+  "inference_gpu_seconds_per_query": 1.376706128915151,
+  "dataset_name": "hotpotqa"
+}
