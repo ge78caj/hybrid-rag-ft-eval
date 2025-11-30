@@ -220,3 +220,45 @@ def save_metrics_csv(metrics: Dict[str, Any], path: str) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerow(metrics)
+
+
+def load_jsonl(path):
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                yield json.loads(line)
+
+def extract_prediction(raw):
+    return raw.split("model\n", 1)[1].strip() if "model\n" in raw else raw.strip()
+
+def main():
+    files = "prediction/normal_hotpotqa_True_predictions.jsonl"
+    gold_answers, predictions, latencies, vram = [], [], [], []
+
+
+    for sample in load_jsonl(files):
+        gold_answers.append(sample["gold_answer"][0])
+        predictions.append(extract_prediction(sample["prediction"]))
+        latencies.append(sample["time"] * 1000.0)
+        vram.append(sample["peak_vram_mb"])
+
+    metrics = compute_all_metrics(
+        gold_answers=gold_answers,
+        predictions=predictions,
+        latencies_ms=latencies,
+        peak_vram_mb=max(vram) if vram else 0.0,
+        params_total_m=0,          
+        params_trainable_m=0,       
+        storage_model_mb=0,        
+        storage_adapters_mb=0,      
+        storage_index_mb=0,         
+        train_gpu_hours=0,            
+        num_gpus=1,
+        dataset_name="hotpotqa",
+    )
+
+    save_metrics_json(metrics, f"results/{files.split('/')[-1].split('.')[0]}.json")
+    save_metrics_csv(metrics, f"results/{files.split('/')[-1].split('.')[0]}.csv")
+
+if __name__ == "__main__":
+    main()
