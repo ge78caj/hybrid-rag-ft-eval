@@ -70,7 +70,6 @@ def compute_em_f1(
     for gold, pred in zip(gold_answers, predictions):
         gold_norm = normalize_answer(gold)
         pred_norm = normalize_answer(pred)
-
         if gold_norm == pred_norm:
             em_count += 1
 
@@ -82,6 +81,65 @@ def compute_em_f1(
     return {
         "em": em,
         "f1": f1,
+    }
+
+
+def _is_sublist(gold_tokens: List[str], pred_tokens: List[str]) -> bool:
+    """
+    Check if gold_tokens appears as a consecutive subsequence in pred_tokens.
+    
+    Examples:
+        gold=["no"], pred=["the", "answer", "is", "no"] -> True
+        gold=["no"], pred=["november"] -> False
+        gold=["no", "way"], pred=["there", "is", "no", "way", "out"] -> True
+        gold=["no", "way"], pred=["way", "to", "say", "no"] -> False
+    """
+    if not gold_tokens:
+        return True
+    if not pred_tokens:
+        return False
+    
+    gold_len = len(gold_tokens)
+    pred_len = len(pred_tokens)
+    
+    if gold_len > pred_len:
+        return False
+    
+    # Sliding window to check if gold_tokens appears consecutively in pred_tokens
+    for i in range(pred_len - gold_len + 1):
+        if pred_tokens[i:i + gold_len] == gold_tokens:
+            return True
+    
+    return False
+
+
+def compute_partial_match_em(
+        gold_answers: List[str],
+        predictions: List[str],
+) -> Dict[str, float]:
+    """
+    Compute Partial Match EM: checks if gold answer tokens appear as a 
+    consecutive subsequence in prediction tokens (preserving order).
+    
+    This avoids false positives like "no" matching "november" by using 
+    word boundaries (tokenization).
+    """
+    assert len(gold_answers) == len(predictions), "Lengths must match"
+
+    total = len(gold_answers)
+    partial_match_count = 0
+
+    for gold, pred in zip(gold_answers, predictions):
+        gold_tokens = normalize_answer(gold).split()
+        pred_tokens = normalize_answer(pred).split()
+
+        if _is_sublist(gold_tokens, pred_tokens):
+            partial_match_count += 1
+
+    partial_em = partial_match_count / total if total > 0 else 0.0
+
+    return {
+        "partial_em": partial_em,
     }
 
 
@@ -157,6 +215,10 @@ def compute_all_metrics(
     # 1) Performance metrics
     perf = compute_em_f1(gold_answers, predictions)
     metrics.update(perf)
+    
+    # 1b) Partial Match EM
+    partial = compute_partial_match_em(gold_answers, predictions)
+    metrics.update(partial)
 
     # 2) Latency / throughput
     latency = compute_latency_stats(latencies_ms)
@@ -227,38 +289,49 @@ def load_jsonl(path):
         for line in f:
             if line.strip():
                 yield json.loads(line)
+                
 
 def extract_prediction(raw):
-    return raw.split("model\n", 1)[1].strip() if "model\n" in raw else raw.strip()
+    if "<ANSWER>:" in raw:
+        return raw.rsplit("<ANSWER>:", 1)[1].strip()
+    return raw.split("assistant\n\n", 1)[1].strip() if "assistant\n\n" in raw else raw.strip()
+
 
 def main():
-    files = "prediction/normal_hotpotqa_True_predictions.jsonl"
-    gold_answers, predictions, latencies, vram = [], [], [], []
+    files = ["prediction/ft_hotpotqa_False_Llama-3.1-8B-Instruct_predictions.jsonl",
+             "prediction/ft_hotpotqa_True_Llama-3.1-8B-Instruct_predictions.jsonl",
+             "prediction/raft_hotpotqa_False_Llama-3.1-8B-Instruct_predictions.jsonl",
+             "prediction/raft_hotpotqa_True_Llama-3.1-8B-Instruct_predictions.jsonl",
+             "prediction/normal_hotpotqa_False_Llama-3.1-8B-Instruct_predictions.jsonl",
+             "prediction/normal_hotpotqa_True_Llama-3.1-8B-Instruct_predictions.jsonl"]
+    
+    for file in files:
+        gold_answers, predictions, latencies, vram = [], [], [], []
 
 
-    for sample in load_jsonl(files):
-        gold_answers.append(sample["gold_answer"][0])
-        predictions.append(extract_prediction(sample["prediction"]))
-        latencies.append(sample["time"] * 1000.0)
-        vram.append(sample["peak_vram_mb"])
+        for sample in load_jsonl(file):
+            gold_answers.append(sample["gold_answer"][0])
+            predictions.append(extract_prediction(sample["prediction"]))
+            latencies.append(sample["time"] * 1000.0)
+            vram.append(sample["peak_vram_mb"])
 
-    metrics = compute_all_metrics(
-        gold_answers=gold_answers,
-        predictions=predictions,
-        latencies_ms=latencies,
-        peak_vram_mb=max(vram) if vram else 0.0,
-        params_total_m=0,          
-        params_trainable_m=0,       
-        storage_model_mb=0,        
-        storage_adapters_mb=0,      
-        storage_index_mb=0,         
-        train_gpu_hours=0,            
-        num_gpus=1,
-        dataset_name="hotpotqa",
-    )
+        metrics = compute_all_metrics(
+            gold_answers=gold_answers,
+            predictions=predictions,
+            latencies_ms=latencies,
+            peak_vram_mb=max(vram) if vram else 0.0,
+            params_total_m=0,          
+            params_trainable_m=0,       
+            storage_model_mb=0,        
+            storage_adapters_mb=0,      
+            storage_index_mb=0,         
+            train_gpu_hours=0,            
+            num_gpus=1,
+            dataset_name="hotpotqa",
+        )
 
-    save_metrics_json(metrics, f"results/{files.split('/')[-1].split('.')[0]}.json")
-    save_metrics_csv(metrics, f"results/{files.split('/')[-1].split('.')[0]}.csv")
+        save_metrics_json(metrics, f"results/{file.split('/')[-1].split('.')[0]}.json")
+        save_metrics_csv(metrics, f"results/{file.split('/')[-1].split('.')[0]}.csv")
 
 if __name__ == "__main__":
     main()
