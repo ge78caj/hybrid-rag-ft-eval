@@ -1,0 +1,2 @@
+em,f1,partial_em,latency_avg_ms,latency_p95_ms,throughput_qps,peak_vram_mb,params_total_m,params_trainable_m,storage_model_mb,storage_adapters_mb,storage_index_mb,train_gpu_hours,num_gpus,inference_gpu_seconds_per_query,dataset_name
+0.006666666666666667,0.029301156707322088,0.05333333333333334,2825.8659744262695,4766.481161117554,0.353873824537283,0,0,0,0,0,0,0,1,2.8258659744262697,squad_v2

@@ -1,0 +1,18 @@
+{
+  "em": 0.36,
+  "f1": 0.3702767323926745,
+  "partial_em": 0.37,
+  "latency_avg_ms": 10676.840394337973,
+  "latency_p95_ms": 14584.690570831299,
+  "throughput_qps": 0.09366066767564582,
+  "peak_vram_mb": 0,
+  "params_total_m": 0,
+  "params_trainable_m": 0,
+  "storage_model_mb": 0,
+  "storage_adapters_mb": 0,
+  "storage_index_mb": 0,
+  "train_gpu_hours": 0,
+  "num_gpus": 1,
+  "inference_gpu_seconds_per_query": 10.676840394337972,
+  "dataset_name": "squad_v2"
+}
