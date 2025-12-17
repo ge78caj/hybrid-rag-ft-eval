@@ -1,0 +1,18 @@
+{
+  "em": 0.0,
+  "f1": 0.0035442732648615,
+  "partial_em": 0.02666666666666667,
+  "latency_avg_ms": 2646.858959992727,
+  "latency_p95_ms": 3406.348466873169,
+  "throughput_qps": 0.3778063036659679,
+  "peak_vram_mb": 0,
+  "params_total_m": 0,
+  "params_trainable_m": 0,
+  "storage_model_mb": 0,
+  "storage_adapters_mb": 0,
+  "storage_index_mb": 0,
+  "train_gpu_hours": 0,
+  "num_gpus": 1,
+  "inference_gpu_seconds_per_query": 2.6468589599927266,
+  "dataset_name": "pubmedqa_v2"
+}

@@ -298,12 +298,14 @@ def extract_prediction(raw):
 
 
 def main():
-    files = ["prediction/ft_hotpotqa_False_Llama-3.1-8B-Instruct_predictions.jsonl",
-             "prediction/ft_hotpotqa_True_Llama-3.1-8B-Instruct_predictions.jsonl",
-             "prediction/raft_hotpotqa_False_Llama-3.1-8B-Instruct_predictions.jsonl",
-             "prediction/raft_hotpotqa_True_Llama-3.1-8B-Instruct_predictions.jsonl",
-             "prediction/normal_hotpotqa_False_Llama-3.1-8B-Instruct_predictions.jsonl",
-             "prediction/normal_hotpotqa_True_Llama-3.1-8B-Instruct_predictions.jsonl"]
+    files = [
+             "prediction/ft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+             "prediction/ft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+             "prediction/raft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+             "prediction/raft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+             "prediction/normal_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+             "prediction/normal_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl"
+            ]
     
     for file in files:
         gold_answers, predictions, latencies, vram = [], [], [], []
@@ -327,7 +329,7 @@ def main():
             storage_index_mb=0,         
             train_gpu_hours=0,            
             num_gpus=1,
-            dataset_name="hotpotqa",
+            dataset_name="pubmedqa_v2",
         )
 
         save_metrics_json(metrics, f"results/{file.split('/')[-1].split('.')[0]}.json")
