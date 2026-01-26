@@ -1,0 +1,47 @@
+{
+  "em": 0.5166666666666667,
+  "f1": 0.5166666666666667,
+  "partial_em": 0.5166666666666667,
+  "classification": {
+    "accuracy": 0.5166666666666667,
+    "macro_f1": 0.3406593406593407,
+    "weighted_f1": 0.35201465201465204,
+    "per_class": {
+      "NO_ANSWER": {
+        "precision": 0.5166666666666667,
+        "recall": 1.0,
+        "f1": 0.6813186813186815,
+        "support": 155
+      },
+      "ANSWERABLE": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 145
+      }
+    },
+    "confusion_matrix": [
+      [
+        155,
+        0
+      ],
+      [
+        145,
+        0
+      ]
+    ]
+  },
+  "latency_avg_ms": 907.7692230542501,
+  "latency_p95_ms": 1157.5555801391602,
+  "throughput_qps": 1.101601568552229,
+  "peak_vram_mb": 0,
+  "params_total_m": 0,
+  "params_trainable_m": 0,
+  "storage_model_mb": 0,
+  "storage_adapters_mb": 0,
+  "storage_index_mb": 0,
+  "train_gpu_hours": 0,
+  "num_gpus": 1,
+  "inference_gpu_seconds_per_query": 0.9077692230542501,
+  "dataset_name": "squad_v2"
+}
