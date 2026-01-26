@@ -1,2 +1,0 @@
-em,f1,partial_em,latency_avg_ms,latency_p95_ms,throughput_qps,peak_vram_mb,params_total_m,params_trainable_m,storage_model_mb,storage_adapters_mb,storage_index_mb,train_gpu_hours,num_gpus,inference_gpu_seconds_per_query,dataset_name
-0.59,0.5903044920976614,0.6033333333333334,16442.82496849696,23935.319900512695,0.06081680014936084,0,0,0,0,0,0,0,1,16.44282496849696,pubmedqa_v2
