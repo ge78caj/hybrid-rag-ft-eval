@@ -143,6 +143,201 @@ def compute_partial_match_em(
     }
 
 
+# ---------- Classification metrics ----------
+
+def compute_classification_metrics(
+        gold_labels: List[str],
+        pred_labels: List[str],
+        target_classes: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Compute classification metrics including confusion matrix,
+    per-class precision/recall/f1, and overall metrics.
+    
+    Args:
+        gold_labels: List of ground truth labels
+        pred_labels: List of predicted labels
+        target_classes: Optional list of class names. If None, inferred from data.
+    
+    Returns:
+        Dict with accuracy, macro_f1, weighted_f1, per_class metrics, and confusion_matrix
+    """
+    assert len(gold_labels) == len(pred_labels), "Lengths must match"
+    
+    # Determine classes
+    if target_classes is None:
+        target_classes = sorted(list(set(gold_labels + pred_labels)))
+    
+    class_to_idx = {cls: idx for idx, cls in enumerate(target_classes)}
+    n_classes = len(target_classes)
+    
+    # Initialize confusion matrix
+    confusion_matrix = [[0 for _ in range(n_classes)] for _ in range(n_classes)]
+    
+    # Build confusion matrix
+    for gold, pred in zip(gold_labels, pred_labels):
+        gold_idx = class_to_idx.get(gold, -1)
+        pred_idx = class_to_idx.get(pred, -1)
+        if gold_idx >= 0 and pred_idx >= 0:
+            confusion_matrix[gold_idx][pred_idx] += 1
+    
+    # Compute per-class metrics
+    per_class_metrics = {}
+    f1_scores = []
+    supports = []
+    
+    for idx, cls in enumerate(target_classes):
+        # True Positives, False Positives, False Negatives
+        tp = confusion_matrix[idx][idx]
+        fp = sum(confusion_matrix[i][idx] for i in range(n_classes) if i != idx)
+        fn = sum(confusion_matrix[idx][i] for i in range(n_classes) if i != idx)
+        support = sum(confusion_matrix[idx])
+        
+        # Precision, Recall, F1
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        per_class_metrics[cls] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": support
+        }
+        
+        f1_scores.append(f1)
+        supports.append(support)
+    
+    # Overall metrics
+    total_correct = sum(confusion_matrix[i][i] for i in range(n_classes))
+    total_samples = sum(supports)
+    accuracy = total_correct / total_samples
+    
+    # Macro F1: simple average
+    macro_f1 = sum(f1_scores) / len(f1_scores)
+    
+    # Weighted F1: weighted by support
+    weighted_f1 = sum(f1 * sup for f1, sup in zip(f1_scores, supports)) / total_samples
+    
+    return {
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+        "per_class": per_class_metrics,
+        "confusion_matrix": confusion_matrix
+    }
+
+
+def compute_no_answer_detection(
+        gold_answers: List[str],
+        predictions: List[str],
+) -> Dict[str, Any]:
+    """
+    Evaluate NO_ANSWER detection as a binary classification task.
+    Uses the same normalization as compute_em_f1 for consistency.
+    
+    Args:
+        gold_answers: List of gold answer strings (or lists containing "NO_ANSWER")
+        predictions: List of predicted answer strings
+    
+    Returns:
+        Classification metrics for NO_ANSWER vs ANSWERABLE
+    """
+    # Convert to binary labels
+    gold_labels = []
+    pred_labels = []
+    
+    for gold, pred in zip(gold_answers, predictions):
+        # Handle gold answer (might be list or string)
+        if isinstance(gold, list):
+            gold_str = gold[0] if gold else ""
+        else:
+            gold_str = gold
+        
+        # Normalize using the same function as EM/F1
+        pred_norm = normalize_answer(pred)
+        
+        # Determine labels
+        gold_label = "NO_ANSWER" if gold_str == "NO_ANSWER" else "ANSWERABLE"
+        
+        # Check if prediction is NO_ANSWER (using same normalization approach)
+        # Empty after normalization or explicit "no answer" tokens
+        pred_tokens = pred_norm.split()
+        is_no_answer = (
+            pred_norm == "" or 
+            pred_norm == "no answer" or
+            pred_norm == "noanswer" or
+            (len(pred_tokens) >= 2 and pred_tokens[0] == "no" and pred_tokens[1] == "answer")
+        )
+        pred_label = "NO_ANSWER" if is_no_answer else "ANSWERABLE"
+        
+        gold_labels.append(gold_label)
+        pred_labels.append(pred_label)
+    
+    return compute_classification_metrics(
+        gold_labels=gold_labels,
+        pred_labels=pred_labels,
+        target_classes=["NO_ANSWER", "ANSWERABLE"]
+    )
+
+
+def compute_yes_no_maybe_classification(
+        gold_answers: List[str],
+        predictions: List[str],
+) -> Dict[str, Any]:
+    """
+    Evaluate yes/no/maybe classification (for datasets like PubMedQA).
+    Uses the same normalization as compute_em_f1 for consistency.
+    
+    Args:
+        gold_answers: List of gold answer strings (or lists)
+        predictions: List of predicted answer strings
+    
+    Returns:
+        Classification metrics for yes/no/maybe
+    """
+    # Convert to labels
+    gold_labels = []
+    pred_labels = []
+    
+    for gold, pred in zip(gold_answers, predictions):
+        # Handle gold answer (might be list or string)
+        if isinstance(gold, list):
+            gold_str = gold[0] if gold else ""
+        else:
+            gold_str = gold
+        
+        # Normalize using the same function as EM/F1
+        gold_norm = normalize_answer(gold_str)
+        pred_norm = normalize_answer(pred)
+        pred_tokens = pred_norm.split()
+        
+        # Determine gold label (should be yes/no/maybe)
+        gold_label = gold_norm if gold_norm in ["yes", "no", "maybe"] else "unknown"
+        
+        # Determine pred label: check exact match first, then token-level match
+        if pred_norm in ["yes", "no", "maybe"]:
+            # Exact match
+            pred_label = pred_norm
+        elif "yes" in pred_tokens:
+            pred_label = "yes"
+        elif "no" in pred_tokens:
+            pred_label = "no"
+        elif "maybe" in pred_tokens:
+            pred_label = "maybe"
+        else:
+            pred_label = "unknown"
+        
+        gold_labels.append(gold_label)
+        pred_labels.append(pred_label)
+    
+    return compute_classification_metrics(
+        gold_labels=gold_labels,
+        pred_labels=pred_labels,
+        target_classes=["yes", "no", "maybe"]
+    )
+
+
 # ---------- Latency / throughput ----------
 
 def compute_latency_stats(latencies_ms: List[float]) -> Dict[str, float]:
@@ -209,6 +404,7 @@ def compute_all_metrics(
 ) -> Dict[str, Any]:
     """
     Compute a unified metrics dict for one run of a given method on a given dataset.
+    Automatically adds classification metrics based on dataset type.
     """
     metrics: Dict[str, Any] = {}
 
@@ -219,6 +415,17 @@ def compute_all_metrics(
     # 1b) Partial Match EM
     partial = compute_partial_match_em(gold_answers, predictions)
     metrics.update(partial)
+    
+    # 1c) Classification metrics (dataset-specific)
+    if dataset_name:
+        if "squad" in dataset_name.lower():
+            # SQuAD v2: NO_ANSWER detection
+            classification = compute_no_answer_detection(gold_answers, predictions)
+            metrics["classification"] = classification
+        elif "pubmedqa" in dataset_name.lower():
+            # PubMedQA: yes/no/maybe classification
+            classification = compute_yes_no_maybe_classification(gold_answers, predictions)
+            metrics["classification"] = classification
 
     # 2) Latency / throughput
     latency = compute_latency_stats(latencies_ms)
@@ -298,42 +505,122 @@ def extract_prediction(raw):
 
 
 def main():
-    files = [
-             "prediction/ft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-             "prediction/ft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
-             "prediction/raft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-             "prediction/raft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
-             "prediction/normal_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-             "prediction/normal_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl"
-            ]
+    """
+    Update existing results files with classification metrics for SQuAD v2 and PubMedQA.
+    """
+    # SQuAD v2 files
+    squad_files = [
+        # "prediction/ft_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/ft_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/raft_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/raft_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "prediction/normal_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "prediction/normal_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+    ]
     
-    for file in files:
+    # PubMedQA files
+    pubmedqa_files = [
+        # "prediction/ft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/ft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/raft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/raft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "prediction/normal_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "prediction/normal_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+    ]
+    
+    all_files = squad_files + pubmedqa_files
+    
+    for file in all_files:
+        if not os.path.exists(file):
+            print(f"Skipping {file} (not found)")
+            continue
+        
+        print(f"Processing {file}...")
+        
+        # Determine dataset name
+        if "squad" in file.lower():
+            dataset_name = "squad_v2"
+        elif "pubmedqa" in file.lower():
+            dataset_name = "pubmedqa_v2"
+        else:
+            dataset_name = None
+        
+        # Load predictions
         gold_answers, predictions, latencies, vram = [], [], [], []
-
-
         for sample in load_jsonl(file):
-            gold_answers.append(sample["gold_answer"][0])
+            # Handle gold_answer (might be list or string)
+            gold_ans = sample["gold_answer"]
+            if isinstance(gold_ans, list):
+                gold_ans = gold_ans[0]
+            gold_answers.append(gold_ans)
             predictions.append(extract_prediction(sample["prediction"]))
             latencies.append(sample["time"] * 1000.0)
             vram.append(sample["peak_vram_mb"])
-
-        metrics = compute_all_metrics(
-            gold_answers=gold_answers,
-            predictions=predictions,
-            latencies_ms=latencies,
-            peak_vram_mb=max(vram) if vram else 0.0,
-            params_total_m=0,          
-            params_trainable_m=0,       
-            storage_model_mb=0,        
-            storage_adapters_mb=0,      
-            storage_index_mb=0,         
-            train_gpu_hours=0,            
-            num_gpus=1,
-            dataset_name="pubmedqa_v2",
-        )
-
-        save_metrics_json(metrics, f"results/{file.split('/')[-1].split('.')[0]}.json")
-        save_metrics_csv(metrics, f"results/{file.split('/')[-1].split('.')[0]}.csv")
+        
+        # Determine result file paths
+        base_name = os.path.basename(file).replace(".jsonl", "")
+        
+        # Find the correct output path (check multiple possible locations)
+        possible_paths = [
+            f"results/Llama-3.2-1B/{dataset_name}/{base_name}.json",
+            f"results/{base_name}.json",
+        ]
+        
+        result_json_path = None
+        result_csv_path = None
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                result_json_path = path
+                result_csv_path = path.replace(".json", ".csv")
+                break
+        
+        if result_json_path is None:
+            print(f"  Warning: No existing results file found for {file}")
+            # Create new metrics
+            metrics = compute_all_metrics(
+                gold_answers=gold_answers,
+                predictions=predictions,
+                latencies_ms=latencies,
+                peak_vram_mb=max(vram) if vram else 0.0,
+                params_total_m=0,
+                params_trainable_m=0,
+                storage_model_mb=0,
+                storage_adapters_mb=0,
+                storage_index_mb=0,
+                train_gpu_hours=0,
+                num_gpus=1,
+                dataset_name=dataset_name,
+            )
+            # Save to default location
+            default_json = f"results/Llama-3.2-1B/{dataset_name}/{base_name}.json"
+            default_csv = f"results/Llama-3.2-1B/{dataset_name}/{base_name}.csv"
+            save_metrics_json(metrics, default_json)
+            save_metrics_csv(metrics, default_csv)
+            print(f"  Created new results at {default_json}")
+        else:
+            # Load existing metrics
+            with open(result_json_path, "r", encoding="utf-8") as f:
+                existing_metrics = json.load(f)
+            
+            # Compute classification metrics
+            if dataset_name == "squad_v2":
+                classification = compute_no_answer_detection(gold_answers, predictions)
+            elif dataset_name == "pubmedqa_v2":
+                classification = compute_yes_no_maybe_classification(gold_answers, predictions)
+            else:
+                classification = None
+            
+            # Add classification metrics to existing results
+            if classification:
+                existing_metrics["classification"] = classification
+                
+                # Save updated metrics
+                save_metrics_json(existing_metrics, result_json_path)
+                save_metrics_csv(existing_metrics, result_csv_path)
+                print(f"  Updated {result_json_path} with classification metrics")
+                print(f"    Accuracy: {classification['accuracy']:.4f}")
+                print(f"    Macro F1: {classification['macro_f1']:.4f}")
 
 if __name__ == "__main__":
     main()

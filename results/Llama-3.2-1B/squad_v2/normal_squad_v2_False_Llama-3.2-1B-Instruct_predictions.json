@@ -2,6 +2,35 @@
   "em": 0.0,
   "f1": 0.04005471149841635,
   "partial_em": 0.02666666666666667,
+  "classification": {
+    "accuracy": 0.48333333333333334,
+    "macro_f1": 0.32584269662921345,
+    "weighted_f1": 0.31498127340823967,
+    "per_class": {
+      "NO_ANSWER": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 155
+      },
+      "ANSWERABLE": {
+        "precision": 0.48333333333333334,
+        "recall": 1.0,
+        "f1": 0.6516853932584269,
+        "support": 145
+      }
+    },
+    "confusion_matrix": [
+      [
+        0,
+        155
+      ],
+      [
+        0,
+        145
+      ]
+    ]
+  },
   "latency_avg_ms": 390.3355685869853,
   "latency_p95_ms": 609.7047328948975,
   "throughput_qps": 2.5618982241869475,
