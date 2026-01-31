@@ -43,5 +43,8 @@
   "train_gpu_hours": 0,
   "num_gpus": 1,
   "inference_gpu_seconds_per_query": 0.3903355685869853,
-  "dataset_name": "squad_v2"
+  "dataset_name": "squad_v2",
+  "em_answerable_only": 0.0,
+  "f1_answerable_only": 0.0828718168932752,
+  "n_answerable": 145
 }

@@ -31,6 +31,9 @@
       ]
     ]
   },
+  "em_answerable_only": 0.0,
+  "f1_answerable_only": 0.0,
+  "n_answerable": 145,
   "latency_avg_ms": 907.7692230542501,
   "latency_p95_ms": 1157.5555801391602,
   "throughput_qps": 1.101601568552229,

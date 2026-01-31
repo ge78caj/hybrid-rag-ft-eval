@@ -53,6 +53,49 @@ def _f1_single(gold: str, pred: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def is_gold_no_answer(gold: str) -> bool:
+    # gold はこのパイプラインではすでに文字列になってる前提
+    return gold == "NO_ANSWER"
+
+
+def is_pred_no_answer(pred: str) -> bool:
+    pred_norm = normalize_answer(pred)
+    pred_tokens = pred_norm.split()
+    return (
+        pred_norm == "" or
+        pred_norm == "no answer" or
+        pred_norm == "noanswer" or
+        (len(pred_tokens) >= 2 and pred_tokens[0] == "no" and pred_tokens[1] == "answer")
+    )
+
+
+def compute_em_f1_on_gold_answerable_only(
+    gold_answers: List[str],
+    predictions: List[str],
+) -> Dict[str, float]:
+    """
+    GoldがANSWERABLEの例だけに絞って EM/F1 を計算。
+    ＝「答えるべき問題での純粋なQA性能」
+    """
+    assert len(gold_answers) == len(predictions), "Lengths must match"
+
+    gold_sub, pred_sub = [], []
+    for g, p in zip(gold_answers, predictions):
+        if not is_gold_no_answer(g):
+            gold_sub.append(g)
+            pred_sub.append(p)
+
+    if len(gold_sub) == 0:
+        return {"em_answerable_only": 0.0, "f1_answerable_only": 0.0, "n_answerable": 0}
+
+    out = compute_em_f1(gold_sub, pred_sub)
+    return {
+        "em_answerable_only": out["em"],
+        "f1_answerable_only": out["f1"],
+        "n_answerable": len(gold_sub),
+    }
+
+
 def compute_em_f1(
         gold_answers: List[str],
         predictions: List[str],
@@ -422,6 +465,8 @@ def compute_all_metrics(
             # SQuAD v2: NO_ANSWER detection
             classification = compute_no_answer_detection(gold_answers, predictions)
             metrics["classification"] = classification
+            metrics.update(compute_em_f1_on_gold_answerable_only(gold_answers, predictions))
+
         elif "pubmedqa" in dataset_name.lower():
             # PubMedQA: yes/no/maybe classification
             classification = compute_yes_no_maybe_classification(gold_answers, predictions)
@@ -510,22 +555,22 @@ def main():
     """
     # SQuAD v2 files
     squad_files = [
-        # "prediction/ft_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        # "prediction/ft_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
-        # "prediction/raft_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        # "prediction/raft_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
-        "prediction/normal_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        "prediction/normal_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/ft_squad_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/ft_squad_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_squad_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_squad_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        "prediction/normal_squad_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        "prediction/normal_squad_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
     ]
     
     # PubMedQA files
     pubmedqa_files = [
-        # "prediction/ft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        # "prediction/ft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
-        # "prediction/raft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        # "prediction/raft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
-        "prediction/normal_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        "prediction/normal_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/ft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/ft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/normal_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/normal_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
     ]
     
     all_files = squad_files + pubmedqa_files
@@ -614,7 +659,10 @@ def main():
             # Add classification metrics to existing results
             if classification:
                 existing_metrics["classification"] = classification
-                
+                if dataset_name == "squad_v2":
+                    existing_metrics.update(
+                        compute_em_f1_on_gold_answerable_only(gold_answers, predictions)
+                    )
                 # Save updated metrics
                 save_metrics_json(existing_metrics, result_json_path)
                 save_metrics_csv(existing_metrics, result_csv_path)

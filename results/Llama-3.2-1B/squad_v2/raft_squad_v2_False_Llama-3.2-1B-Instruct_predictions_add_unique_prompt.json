@@ -1,0 +1,50 @@
+{
+  "em": 0.4266666666666667,
+  "f1": 0.49190445687797973,
+  "partial_em": 0.5133333333333333,
+  "classification": {
+    "accuracy": 0.64,
+    "macro_f1": 0.6397438178260096,
+    "weighted_f1": 0.6394235901085216,
+    "per_class": {
+      "NO_ANSWER": {
+        "precision": 0.6715328467153284,
+        "recall": 0.5935483870967742,
+        "f1": 0.6301369863013699,
+        "support": 155
+      },
+      "ANSWERABLE": {
+        "precision": 0.6134969325153374,
+        "recall": 0.6896551724137931,
+        "f1": 0.6493506493506493,
+        "support": 145
+      }
+    },
+    "confusion_matrix": [
+      [
+        92,
+        63
+      ],
+      [
+        45,
+        100
+      ]
+    ]
+  },
+  "latency_avg_ms": 8756.861255963644,
+  "latency_p95_ms": 11813.820362091064,
+  "throughput_qps": 0.11419616809835542,
+  "peak_vram_mb": 0,
+  "params_total_m": 0,
+  "params_trainable_m": 0,
+  "storage_model_mb": 0,
+  "storage_adapters_mb": 0,
+  "storage_index_mb": 0,
+  "train_gpu_hours": 0,
+  "num_gpus": 1,
+  "inference_gpu_seconds_per_query": 8.756861255963644,
+  "dataset_name": "squad_v2",
+  "em_answerable_only": 0.2482758620689655,
+  "f1_answerable_only": 0.3831391296419844,
+  "n_answerable": 145
+}
