@@ -1,2 +1,0 @@
-em,f1,partial_em,latency_avg_ms,latency_p95_ms,throughput_qps,peak_vram_mb,params_total_m,params_trainable_m,storage_model_mb,storage_adapters_mb,storage_index_mb,train_gpu_hours,num_gpus,inference_gpu_seconds_per_query,dataset_name
-0.65,0.7958559218559222,0.7333333333333333,33202.35263903936,47181.48112297058,0.03011834766263518,6274.06396484375,0,0,0,0,0,0,1,33.20235263903936,hotpotqa

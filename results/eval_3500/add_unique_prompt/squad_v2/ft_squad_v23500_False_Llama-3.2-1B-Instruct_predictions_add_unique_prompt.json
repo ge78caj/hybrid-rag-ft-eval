@@ -1,0 +1,50 @@
+{
+  "em": 0.48914285714285716,
+  "f1": 0.4960058304640538,
+  "partial_em": 0.49142857142857144,
+  "classification": {
+    "accuracy": 0.5268571428571428,
+    "macro_f1": 0.4150831054283437,
+    "weighted_f1": 0.4188819616023943,
+    "per_class": {
+      "NO_ANSWER": {
+        "precision": 0.5184388444990781,
+        "recall": 0.9498873873873874,
+        "f1": 0.6707753479125249,
+        "support": 1776
+      },
+      "ANSWERABLE": {
+        "precision": 0.6382113821138211,
+        "recall": 0.09106728538283063,
+        "f1": 0.15939086294416244,
+        "support": 1724
+      }
+    },
+    "confusion_matrix": [
+      [
+        1687,
+        89
+      ],
+      [
+        1567,
+        157
+      ]
+    ]
+  },
+  "em_answerable_only": 0.014501160092807424,
+  "f1_answerable_only": 0.02843411057087478,
+  "n_answerable": 1724,
+  "latency_avg_ms": 141.59031541006905,
+  "latency_p95_ms": 154.069185256958,
+  "throughput_qps": 7.062629934143688,
+  "peak_vram_mb": 0,
+  "params_total_m": 0,
+  "params_trainable_m": 0,
+  "storage_model_mb": 0,
+  "storage_adapters_mb": 0,
+  "storage_index_mb": 0,
+  "train_gpu_hours": 0,
+  "num_gpus": 1,
+  "inference_gpu_seconds_per_query": 0.14159031541006906,
+  "dataset_name": "squad_v2"
+}

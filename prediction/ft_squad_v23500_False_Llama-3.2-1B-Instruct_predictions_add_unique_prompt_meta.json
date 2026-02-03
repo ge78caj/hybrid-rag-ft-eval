@@ -1,0 +1,8 @@
+{
+  "model_id": "meta-llama/Llama-3.2-1B-Instruct",
+  "ft_mode": "ft",
+  "use_rag": false,
+  "dataset_path": "/content/drive/MyDrive/Colab Notebooks/RAFT/dataset/squad_v2/validation_gpt41mini_3500/data-00000-of-00001.arrow",
+  "rag_corpus_path": "/content/drive/MyDrive/Colab Notebooks/RAFT/dataset/squad_v2/validation_gpt41mini_3500/squad_validation_rag_corpus",
+  "global_peak_vram_gb": 4.656193733215332
+}

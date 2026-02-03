@@ -1,0 +1,60 @@
+{
+  "em": 0.8682857142857143,
+  "f1": 0.8682857142857143,
+  "partial_em": 0.8682857142857143,
+  "classification": {
+    "accuracy": 0.8685338668190912,
+    "macro_f1": 0.34438749953864084,
+    "weighted_f1": 0.8695429951601849,
+    "per_class": {
+      "yes": {
+        "precision": 0.9303114400246685,
+        "recall": 0.9308855291576674,
+        "f1": 0.9305983960518199,
+        "support": 3241
+      },
+      "no": {
+        "precision": 0.1286549707602339,
+        "recall": 0.08527131782945736,
+        "f1": 0.10256410256410257,
+        "support": 258
+      },
+      "maybe": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 0
+      }
+    },
+    "confusion_matrix": [
+      [
+        3017,
+        149,
+        75
+      ],
+      [
+        226,
+        22,
+        10
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ]
+  },
+  "latency_avg_ms": 137.84506470816476,
+  "latency_p95_ms": 161.6835594177246,
+  "throughput_qps": 7.254521604506661,
+  "peak_vram_mb": 0,
+  "params_total_m": 0,
+  "params_trainable_m": 0,
+  "storage_model_mb": 0,
+  "storage_adapters_mb": 0,
+  "storage_index_mb": 0,
+  "train_gpu_hours": 0,
+  "num_gpus": 1,
+  "inference_gpu_seconds_per_query": 0.13784506470816477,
+  "dataset_name": "pubmedqa_v2"
+}
