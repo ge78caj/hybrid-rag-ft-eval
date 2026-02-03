@@ -1,0 +1,104 @@
+﻿{
+  "utility": {
+    "alpha_f1": 1.0,
+    "beta_em": 0.5,
+    "gamma_loose_em": 0.0,
+    "lambda_latency": 0.01,
+    "mu_vram": 0.0,
+
+    "latency_caps_seconds": {
+      "default": 3.0,
+      "by_dataset": {
+        "hotpotqa": {
+          "default": 3.0,
+          "base_only": 1.0,
+          "sft_only": 1.0,
+          "base_rag": 2.5,
+          "sft_rag": 5.0,
+          "raft_rag": 18.0
+        },
+        "squad_v2": {
+          "default": 3.0,
+          "base_only": 1.0,
+          "sft_only": 1.0,
+          "base_rag": 3.0,
+          "sft_rag": 6.0,
+          "raft_rag": 18.0
+        },
+        "pubmedqa_v2": {
+          "default": 5.0,
+          "base_only": 1.5,
+          "sft_only": 1.5,
+          "base_rag": 5.0,
+          "sft_rag": 6.0,
+          "raft_rag": 30.0
+        }
+      }
+    }
+  },
+  
+  "training": {
+    "seed": 1337,
+    "epochs": 80,
+    "batch_size": 64,
+    "lr": 0.0008,
+    "weight_decay": 0.001,
+    "hidden_dim": 256,
+    "dropout": 0.10,
+    "tau": 0.7,
+    "patience": 12,
+    "min_delta": 0.0002,
+    "class_balance_power": 0.5,
+    "use_margin_weighting": true,
+    "margin_m0": 0.25,
+
+    "allowed_experts": [
+      "base_only",
+      "base_rag",
+      "sft_only",
+      "sft_rag",
+      "raft_rag"
+    ]
+  },
+  "datasets": {
+    "hotpotqa": {
+      "router_train_out": "prediction/router_train_hotpotqa.jsonl",
+      "embed_models": [
+        "sentence-transformers/all-mpnet-base-v2"
+      ],
+      "experts": {
+        "base_only": "prediction/normal_hotpotqa_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "base_rag": "prediction/normal_hotpotqa_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "sft_only": "prediction/ft_hotpotqa_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "sft_rag": "prediction/ft_hotpotqa_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "raft_rag": "prediction/raft_hotpotqa_True_Llama-3.2-1B-Instruct_predictions.jsonl"
+      }
+    },
+    "squad_v2": {
+      "router_train_out": "prediction/router_train_squad_v2.jsonl",
+      "embed_models": [
+        "sentence-transformers/all-mpnet-base-v2"
+      ],
+      "experts": {
+        "base_only": "prediction/normal_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "base_rag": "prediction/normal_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "sft_only": "prediction/ft_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "sft_rag": "prediction/ft_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "raft_rag": "prediction/raft_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl"
+      }
+    },
+    "pubmedqa_v2": {
+      "router_train_out": "prediction/router_train_pubmedqa_v2.jsonl",
+      "embed_models": [
+        "pritamdeka/S-PubMedBert-MS-MARCO"
+      ],
+      "experts": {
+        "base_only": "prediction/normal_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "base_rag": "prediction/normal_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "sft_only": "prediction/ft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "sft_rag": "prediction/ft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        "raft_rag": "prediction/raft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl"
+      }
+    }
+  }
+}
