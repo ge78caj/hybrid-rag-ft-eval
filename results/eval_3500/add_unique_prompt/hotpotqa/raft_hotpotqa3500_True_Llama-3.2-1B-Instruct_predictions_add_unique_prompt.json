@@ -1,0 +1,17 @@
+{
+  "em": 0.3891428571428571,
+  "f1": 0.5211916310339845,
+  "partial_em": 0.47085714285714286,
+  "latency_avg_ms": 9846.50430032185,
+  "latency_p95_ms": 14698.867082595825,
+  "throughput_qps": 0.10155888521445251,
+  "peak_vram_mb": 0,
+  "params_total_m": 0,
+  "params_trainable_m": 0,
+  "storage_model_mb": 0,
+  "storage_adapters_mb": 0,
+  "storage_index_mb": 0,
+  "train_gpu_hours": 0,
+  "num_gpus": 1,
+  "inference_gpu_seconds_per_query": 9.84650430032185
+}
