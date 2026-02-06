@@ -25,7 +25,7 @@
           "sft_rag": 6.0,
           "raft_rag": 18.0
         },
-        "pubmedqa_v2": {
+        "pubmed": {
           "default": 5.0,
           "base_only": 1.5,
           "sft_only": 1.5,
@@ -85,19 +85,6 @@
         "sft_only": "prediction/ft_squad_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
         "sft_rag": "prediction/ft_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
         "raft_rag": "prediction/raft_squad_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl"
-      }
-    },
-    "pubmedqa_v2": {
-      "router_train_out": "prediction/router_train_pubmedqa_v2.jsonl",
-      "embed_models": [
-        "pritamdeka/S-PubMedBert-MS-MARCO"
-      ],
-      "experts": {
-        "base_only": "prediction/normal_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        "base_rag": "prediction/normal_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
-        "sft_only": "prediction/ft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        "sft_rag": "prediction/ft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
-        "raft_rag": "prediction/raft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl"
       }
     }
   }

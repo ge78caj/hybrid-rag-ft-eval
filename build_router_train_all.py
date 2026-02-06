@@ -1,10 +1,12 @@
-﻿# build_router_train_all.py
+# build_router_train_all.py
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from metrics import compute_em_f1_multi_gold, extract_prediction
+from collections import Counter
+
+from metrics import extract_prediction, normalize_answer  # <-- use normalizer from metrics
 
 CFG_PATH = Path("configs/router_config.json")
 PRED_DIR = Path("prediction")
@@ -80,6 +82,54 @@ def _resolve_prediction_path(pattern_or_path: str) -> Optional[Path]:
 
 
 # -----------------------
+# Multi-gold EM/F1 scorer
+# -----------------------
+
+def _f1_tokens(gold: str, pred: str) -> float:
+    gold_toks = normalize_answer(gold).split()
+    pred_toks = normalize_answer(pred).split()
+
+    # both empty => perfect
+    if len(gold_toks) == 0 and len(pred_toks) == 0:
+        return 1.0
+    # one empty => 0
+    if len(gold_toks) == 0 or len(pred_toks) == 0:
+        return 0.0
+
+    common = Counter(gold_toks) & Counter(pred_toks)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+
+    precision = num_same / len(pred_toks)
+    recall = num_same / len(gold_toks)
+    return (2 * precision * recall) / (precision + recall)
+
+
+def _score_multi_gold(gold_answers: List[str], pred_text: str) -> Dict[str, float]:
+    """
+    Score ONE example where gold_answers can contain multiple acceptable strings.
+    EM = max over golds
+    F1 = max over golds
+    loose_em = same as EM here
+    """
+    pred_norm = normalize_answer(pred_text or "")
+    em_best = 0.0
+    f1_best = 0.0
+
+    for g in (gold_answers or [""]):
+        g_norm = normalize_answer(g)
+        em = 1.0 if g_norm == pred_norm else 0.0
+        f1 = _f1_tokens(g, pred_text or "")
+        if em > em_best:
+            em_best = em
+        if f1 > f1_best:
+            f1_best = f1
+
+    return {"em": em_best, "f1": f1_best, "loose_em": em_best}
+
+
+# -----------------------
 # PubMedQA label handling
 # -----------------------
 
@@ -117,23 +167,89 @@ def _extract_yes_no_maybe(text: str) -> str:
 def _score_pubmedqa(gold_answers: List[str], pred_text: str) -> Dict[str, float]:
     """
     Score PubMedQA as label classification on {yes,no,maybe}.
-    We treat it as EM/F1 over the label (token F1 = EM for single token).
+    If gold isn't a clean label, fall back to multi-gold EM/F1.
     """
     gold_label = _extract_yes_no_maybe(gold_answers[0] if gold_answers else "")
     pred_label = _extract_yes_no_maybe(pred_text)
 
-    # If gold isn't a clean label, fall back to multi-gold EM/F1
     if gold_label not in _LABELS:
-        return compute_em_f1_multi_gold(gold_answers, pred_text)
+        return _score_multi_gold(gold_answers, pred_text)
+
+    em = 1.0 if pred_label == gold_label else 0.0
+    return {"em": em, "f1": em, "loose_em": em}
+
+
+# -----------------------
+# HotpotQA yes/no handling
+# -----------------------
+
+_YESNO = {"yes", "no"}
+
+
+def _extract_yes_no_hotpot(text: str) -> str:
+    """
+    Convert a free-form answer into {yes,no,unknown}.
+    Handles "<ANSWER>:" style + common paraphrases.
+    """
+    tn = (text or "").strip().lower()
+
+    # Prefer explicit answer tag
+    if "<answer>:" in tn:
+        after = tn.rsplit("<answer>:", 1)[1].strip()
+        first = _normalize_label(after.split()[0]) if after else ""
+        if first in _YESNO:
+            return first
+    if "<answer>" in tn:
+        after = tn.rsplit("<answer>", 1)[1].strip().lstrip(":").strip()
+        first = _normalize_label(after.split()[0]) if after else ""
+        if first in _YESNO:
+            return first
+
+    tokens = re.findall(r"[a-z]+", tn)
+    if "yes" in tokens:
+        return "yes"
+    if "no" in tokens:
+        return "no"
+
+    # Heuristic paraphrases for nationality/same-entity style yes/no
+    if re.search(r"\b(different|not the same)\b", tn):
+        return "no"
+    if re.search(r"\b(same|of the same|both)\b", tn):
+        return "yes"
+
+    return "unknown"
+
+
+def _score_hotpotqa_yesno(gold_answers: List[str], pred_text: str) -> Dict[str, float]:
+    """
+    If gold is yes/no, score as yes/no classification.
+    Otherwise fall back to multi-gold F1/EM.
+    """
+    gold_label = _normalize_label(gold_answers[0] if gold_answers else "")
+    if gold_label not in _YESNO:
+        return _score_multi_gold(gold_answers, pred_text)
+
+    pred_label = _extract_yes_no_hotpot(pred_text)
+    if pred_label not in _YESNO:
+        return _score_multi_gold(gold_answers, pred_text)
 
     em = 1.0 if pred_label == gold_label else 0.0
     return {"em": em, "f1": em, "loose_em": em}
 
 
 def _score_generic(dataset_name: str, gold_answers: List[str], pred_text: str) -> Dict[str, float]:
-    if "pubmedqa" in dataset_name.lower():
+    name = (dataset_name or "").lower()
+
+    if "hotpotqa" in name:
+        gl = _normalize_label(gold_answers[0] if gold_answers else "")
+        if gl in _YESNO:
+            return _score_hotpotqa_yesno(gold_answers, pred_text)
+        return _score_multi_gold(gold_answers, pred_text)
+
+    if "pubmedqa" in name:
         return _score_pubmedqa(gold_answers, pred_text)
-    return compute_em_f1_multi_gold(gold_answers, pred_text)
+
+    return _score_multi_gold(gold_answers, pred_text)
 
 
 # -----------------------
@@ -162,7 +278,6 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
     if not experts_cfg:
         raise RuntimeError(f"[{dataset_name}] No experts configured in router_config.json")
 
-    # Only keep experts that are in canonical order, and keep that order.
     expert_names = [e for e in canonical_order if e in experts_cfg]
     if not expert_names:
         raise RuntimeError(
@@ -171,7 +286,6 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
             f"ds_cfg.experts={list(experts_cfg.keys())}"
         )
 
-    # Load all experts into id->row maps
     expert_maps: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for expert_name in expert_names:
         pattern = experts_cfg[expert_name]
@@ -190,7 +304,6 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
         expert_maps[expert_name] = m
         print(f"[{dataset_name}] expert={expert_name} -> {p} (rows={len(rows)})")
 
-    # Intersect IDs across experts
     all_ids: Optional[set] = None
     for m in expert_maps.values():
         ids = set(m.keys())
@@ -219,7 +332,6 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
             if not question or not gold:
                 continue
 
-            # IMPORTANT: write experts dict in canonical expert_names order
             expert_outcomes: Dict[str, Any] = {}
             for expert_name in expert_names:
                 r = expert_maps[expert_name][rid]
@@ -231,9 +343,8 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
                 scores = _score_generic(dataset_name, gold, pred_extracted)
                 f1 = float(scores.get("f1", 0.0))
                 em = float(scores.get("em", 0.0))
-                loose_em = float(scores.get("loose_em", 0.0)) if "loose_em" in scores else 0.0
+                loose_em = float(scores.get("loose_em", em))
 
-                # keep the same fields your training/eval expect
                 expert_outcomes[expert_name] = {
                     "prediction": pred_extracted,
                     "prediction_raw": raw_pred,
