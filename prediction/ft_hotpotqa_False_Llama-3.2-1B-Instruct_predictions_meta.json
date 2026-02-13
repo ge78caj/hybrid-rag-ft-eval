@@ -1,8 +1,0 @@
-{
-  "model_id": "meta-llama/Llama-3.2-1B-Instruct",
-  "ft_mode": "ft",
-  "use_rag": false,
-  "dataset_path": "/content/drive/MyDrive/Colab Notebooks/RAFT/dataset/hotpotqa/validation/data-00000-of-00001.arrow",
-  "rag_corpus_path": "/content/drive/MyDrive/Colab Notebooks/RAFT/dataset/hotpotqa/validation/hotpotqa_validation_rag_corpus",
-  "global_peak_vram_gb": 5.1474995613098145
-}
