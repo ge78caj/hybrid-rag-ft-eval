@@ -2,3 +2,14 @@
 methods/multi_lora/*.joblib
 __pycache__/
 *.pyc
+results/
+prediction/
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
