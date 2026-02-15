@@ -15,7 +15,7 @@ CFG_PATH = Path("configs/router_config.json")
 PRED_DIR = Path("prediction")
 
 RAG_EXPERTS = ["base_rag", "sft_rag", "raft_rag"]
-NO_EXPERTS  = ["base_only", "sft_only"]
+NO_EXPERTS = ["base_only", "sft_only"]
 DATASETS = ["hotpotqa", "squad_v2", "pubmedqa_v2"]
 
 
@@ -78,7 +78,6 @@ def policy_for_dataset(dataset: str) -> Optional[bool]:
 
 
 def _get_gold_field(row: Dict[str, Any]) -> Any:
-    # Be robust to different keys used across versions
     if "gold_answer" in row:
         return row.get("gold_answer")
     if "gold_answers" in row:
@@ -111,9 +110,29 @@ def load_gate(model_dir: Path, device: str, hidden_dim: int, dropout: float) -> 
             "embed_model": ckpt.get("embed_model"),
             "model": None,
             "gate_delta": ckpt.get("gate_delta"),
+            "gate_objective": "forced",
+            "calibrated_threshold": float(ckpt.get("calibrated_threshold", 0.0) or 0.0),
         }
 
     in_dim = int(ckpt["in_dim"])
+    gate_objective = str(ckpt.get("gate_objective", "cls"))
+
+    # NEW: delta regression gate (out_dim=1)
+    if gate_objective == "delta_reg":
+        model = MLP(in_dim, hidden_dim, dropout, out_dim=1)
+        model.load_state_dict(ckpt["state_dict"])
+        model.to(device).eval()
+        return {
+            "forced_policy": None,
+            "in_dim": in_dim,
+            "embed_model": ckpt.get("embed_model"),
+            "model": model,
+            "gate_delta": ckpt.get("gate_delta"),
+            "gate_objective": "delta_reg",
+            "calibrated_threshold": float(ckpt.get("calibrated_threshold", 0.0) or 0.0),
+        }
+
+    # default: classifier gate (out_dim=2)
     model = MLP(in_dim, hidden_dim, dropout, out_dim=2)
     model.load_state_dict(ckpt["state_dict"])
     model.to(device).eval()
@@ -123,6 +142,8 @@ def load_gate(model_dir: Path, device: str, hidden_dim: int, dropout: float) -> 
         "embed_model": ckpt.get("embed_model"),
         "model": model,
         "gate_delta": ckpt.get("gate_delta"),
+        "gate_objective": "cls",
+        "calibrated_threshold": float(ckpt.get("calibrated_threshold", 0.0) or 0.0),
     }
 
 
@@ -165,7 +186,6 @@ def load_answerability(model_dir: Path, device: str, hidden_dim: int, dropout: f
 
 def tradeoff_from_cfg(cfg: Dict[str, Any]) -> Dict[str, float]:
     t = (cfg.get("tradeoff") or {})
-    # Defaults = "quality first" unless you set these in configs/router_config.json
     return {
         "w_f1": float(t.get("w_f1", 1.0)),
         "w_em": float(t.get("w_em", 0.0)),
@@ -192,32 +212,50 @@ def get_vram_gb(outcome: Dict[str, Any]) -> float:
 
 
 def tradeoff_U(outcome: Dict[str, Any], tcfg: Dict[str, float]) -> float:
-    # quality
     f1 = float(outcome.get("f1", 0.0) or 0.0)
     em = float(outcome.get("em", 0.0) or 0.0)
     loose = float(outcome.get("loose_em", em) or em)
     Q = tcfg["w_f1"] * f1 + tcfg["w_em"] * em + tcfg["w_loose"] * loose
 
-    # costs
     L = get_latency_s(outcome)
     V = get_vram_gb(outcome)
 
-    cost_norm = (tcfg["wL"] * (L / max(1e-8, tcfg["sla_latency_s"]))) + (tcfg["wV"] * (V / max(1e-8, tcfg["vram_budget_gb"])))
+    cost_norm = (tcfg["wL"] * (L / max(1e-8, tcfg["sla_latency_s"]))) + (
+            tcfg["wV"] * (V / max(1e-8, tcfg["vram_budget_gb"]))
+    )
     U = Q - tcfg["lambda_cost"] * cost_norm
 
-    # barrier penalties near/over SLA (optional)
     if tcfg["beta_lat"] > 0.0:
-        U -= tcfg["beta_lat"] * float(np.exp(tcfg["gamma_lat"] * max(0.0, (L - tcfg["sla_latency_s"]) / max(1e-8, tcfg["sla_latency_s"]))))
+        U -= tcfg["beta_lat"] * float(
+            np.exp(
+                tcfg["gamma_lat"]
+                * max(0.0, (L - tcfg["sla_latency_s"]) / max(1e-8, tcfg["sla_latency_s"]))
+            )
+        )
     if tcfg["beta_vram"] > 0.0:
-        U -= tcfg["beta_vram"] * float(np.exp(tcfg["gamma_vram"] * max(0.0, (V - tcfg["vram_budget_gb"]) / max(1e-8, tcfg["vram_budget_gb"]))))
+        U -= tcfg["beta_vram"] * float(
+            np.exp(
+                tcfg["gamma_vram"]
+                * max(0.0, (V - tcfg["vram_budget_gb"]) / max(1e-8, tcfg["vram_budget_gb"]))
+            )
+        )
     return float(U)
 
 
 def no_answer_outcome(row: Dict[str, Any]) -> Dict[str, Any]:
-    # If you predict NO_ANSWER:
-    # - correct iff gold is NO_ANSWER
     ok = 1.0 if is_squad_no_answer_gold(row) else 0.0
     return {"f1": ok, "em": ok, "loose_em": ok, "latency": 0.0, "vram_mb": 0.0}
+
+
+def parse_csv_floats(s: Optional[str]) -> Optional[List[float]]:
+    if not s:
+        return None
+    out = []
+    for x in s.split(","):
+        x = x.strip()
+        if x:
+            out.append(float(x))
+    return out
 
 
 def main():
@@ -230,21 +268,72 @@ def main():
     ap.add_argument("--hidden_dim", type=int, default=256)
     ap.add_argument("--dropout", type=float, default=0.10)
 
-    ap.add_argument("--oracle_policy_aligned", action="store_true",
-                    help="If dataset has forced policy (True/False), oracle is restricted to that pool. "
-                         "NO_ANSWER is still considered on squad_v2.")
-    ap.add_argument("--tradeoff_mode", action="store_true",
-                    help="Evaluate using tradeoff_U (quality - lambda*cost - penalties).")
-    ap.add_argument("--sweep_lambda_cost", type=str, default=None,
-                    help='Comma-separated lambda_cost values, e.g. "0,0.02,0.05,0.1". Only in tradeoff_mode.')
+    ap.add_argument(
+        "--oracle_policy_aligned",
+        action="store_true",
+        help="If dataset has forced policy (True/False), oracle is restricted to that pool. "
+             "NO_ANSWER is still considered on squad_v2.",
+    )
+    ap.add_argument(
+        "--tradeoff_mode",
+        action="store_true",
+        help="Evaluate using tradeoff_U (quality - lambda*cost - penalties).",
+    )
+    ap.add_argument(
+        "--sweep_lambda_cost",
+        type=str,
+        default=None,
+        help='Comma-separated lambda_cost values, e.g. "0,0.02,0.05,0.1". Only in tradeoff_mode.',
+    )
 
-    # ✅ NEW: use answerability head (SQuAD v2 only)
-    ap.add_argument("--use_answerability", action="store_true",
-                    help="Use the trained answerability head on squad_v2 to optionally abstain with NO_ANSWER.")
-    ap.add_argument("--ans_threshold", type=float, default=0.5,
-                    help="Threshold on P(answerable) to decide abstain (predict NO_ANSWER). Used only with --use_answerability.")
+    # Answerability (SQuAD v2 only)
+    ap.add_argument(
+        "--use_answerability",
+        action="store_true",
+        help="Use the trained answerability head on squad_v2 to optionally abstain with NO_ANSWER.",
+    )
+    ap.add_argument(
+        "--ans_threshold",
+        type=float,
+        default=0.5,
+        help="Threshold on P(answerable) to decide abstain (predict NO_ANSWER). Used only with --use_answerability.",
+    )
+
+    # Gate threshold / sweep
+    ap.add_argument(
+        "--gate_threshold",
+        type=float,
+        default=None,
+        help=(
+            "Gate decision threshold. "
+            "If gate_objective=cls: use p(rag)>=threshold. "
+            "If gate_objective=delta_reg: use pred_delta>threshold. "
+            "If not set: uses checkpoint calibrated_threshold if present, otherwise argmax/0."
+        ),
+    )
+    ap.add_argument(
+        "--sweep_gate_threshold",
+        type=str,
+        default=None,
+        help='Comma-separated thresholds, e.g. "0.1,0.2,0.3,0.4,0.5".',
+    )
+
+    # decomposition modes
+    ap.add_argument(
+        "--oracle_gate",
+        action="store_true",
+        help="Use oracle family (RAG vs NO-RAG) for each example, then apply learned selector within that family.",
+    )
+    ap.add_argument(
+        "--oracle_selector",
+        action="store_true",
+        help="Use learned gate family, but inside the chosen family pick the oracle best expert.",
+    )
 
     args = ap.parse_args()
+
+    if args.oracle_gate and args.oracle_selector:
+        raise SystemExit("Choose at most one of --oracle_gate or --oracle_selector (or neither).")
 
     cfg = load_cfg()
     model_root = Path(args.model_dir)
@@ -256,9 +345,8 @@ def main():
     else:
         print("\n==================== OFFLINE TWO-STAGE EVAL (utility-aligned) ====================\n")
 
-    lambdas = None
-    if args.sweep_lambda_cost:
-        lambdas = [float(x.strip()) for x in args.sweep_lambda_cost.split(",") if x.strip()]
+    lambdas = parse_csv_floats(args.sweep_lambda_cost)
+    thr_sweep = parse_csv_floats(args.sweep_gate_threshold)
 
     for dataset in DATASETS:
         if args.only and dataset != args.only:
@@ -272,7 +360,7 @@ def main():
 
         gate = load_gate(model_dir, args.device, args.hidden_dim, args.dropout)
         sel_rag = load_selector(model_dir, "rag", args.device, args.hidden_dim, args.dropout)
-        sel_no  = load_selector(model_dir, "no_rag", args.device, args.hidden_dim, args.dropout)
+        sel_no = load_selector(model_dir, "no_rag", args.device, args.hidden_dim, args.dropout)
 
         ans_head = None
         if dataset == "squad_v2" and args.use_answerability:
@@ -303,8 +391,59 @@ def main():
                 return RAG_EXPERTS if pol is True else NO_EXPERTS
             return RAG_EXPERTS + NO_EXPERTS
 
-        # evaluation helper
-        def run_eval(lambda_override: Optional[float] = None) -> Dict[str, Any]:
+        def best_in_family(ex: Dict[str, Any], fam: str, tcfg: Dict[str, float]) -> str:
+            pool = RAG_EXPERTS if fam == "rag" else NO_EXPERTS
+            best_e, best_v = None, -1e18
+            for e in pool:
+                out = ex[e]
+                v = tradeoff_U(out, tcfg) if args.tradeoff_mode else float(out.get("f1", 0.0))
+                if v > best_v:
+                    best_v, best_e = v, e
+            return str(best_e)
+
+        def family_oracle_label(ex: Dict[str, Any], tcfg: Dict[str, float]) -> str:
+            best_rag = best_in_family(ex, "rag", tcfg)
+            best_no = best_in_family(ex, "no", tcfg)
+            out_r = ex[best_rag]
+            out_n = ex[best_no]
+            vr = tradeoff_U(out_r, tcfg) if args.tradeoff_mode else float(out_r.get("f1", 0.0))
+            vn = tradeoff_U(out_n, tcfg) if args.tradeoff_mode else float(out_n.get("f1", 0.0))
+            return "rag" if vr > vn else "no"
+
+        def default_gate_threshold() -> float:
+            if args.gate_threshold is not None:
+                return float(args.gate_threshold)
+            # fall back to checkpoint calibrated threshold if available (works for both gate types)
+            return float(gate.get("calibrated_threshold", 0.0) or 0.0)
+
+        def gate_predict_family(xi: torch.Tensor, gate_threshold: Optional[float]) -> str:
+            # policy overrides
+            if pol is True:
+                return "rag"
+            if pol is False:
+                return "no"
+
+            gmodel = gate["model"]
+            if gmodel is None:
+                # should not happen for pol None, but be safe
+                return "no"
+
+            thr = default_gate_threshold() if gate_threshold is None else float(gate_threshold)
+
+            with torch.no_grad():
+                if gate.get("gate_objective") == "delta_reg":
+                    pred_delta = float(gmodel(xi.unsqueeze(0)).squeeze(0).squeeze(-1).item())
+                    return "rag" if pred_delta > thr else "no"
+                else:
+                    logits = gmodel(xi.unsqueeze(0))[0]
+                    probs = torch.softmax(logits, dim=0)  # [p(no), p(rag)]
+                    p_rag = float(probs[1].item())
+                    if gate_threshold is None and args.gate_threshold is None and "calibrated_threshold" not in gate:
+                        # classic behavior: argmax if no thresholds available
+                        return "rag" if int(torch.argmax(probs).item()) == 1 else "no"
+                    return "rag" if p_rag >= thr else "no"
+
+        def run_eval(lambda_override: Optional[float] = None, gate_threshold: Optional[float] = None) -> Dict[str, Any]:
             chosen_f1 = chosen_em = chosen_u = 0.0
             oracle_f1 = oracle_em = oracle_u = 0.0
 
@@ -312,9 +451,15 @@ def main():
             gate_counts = Counter()
             ans_counts = Counter()
 
+            gate_oracle_TN = gate_oracle_TP = gate_oracle_FP = gate_oracle_FN = 0
+
+            # selector diagnostics
+            ent_sum = 0.0
+            maxp_sum = 0.0
+            diag_steps = 0
+
             # answerability confusion counts (SQuAD only)
             ans_tp = ans_fp = ans_tn = ans_fn = 0  # positive = "ANSWERABLE"
-            # (so NO_ANSWER gold is negative class)
 
             tcfg = tradeoff_from_cfg(cfg)
             if lambda_override is not None:
@@ -327,7 +472,7 @@ def main():
                 ex = r["experts"]
                 xi = X[i].to(args.device)
 
-                # 1) Answerability decision (SQuAD v2 only, optional)
+                # 1) Answerability (optional, SQuAD v2 only)
                 predicted_no_answer = False
                 if dataset == "squad_v2" and ans_head is not None:
                     gold_no_answer = is_squad_no_answer_gold(r)
@@ -341,10 +486,8 @@ def main():
 
                     predicted_answerable = (p_answerable >= float(args.ans_threshold))
                     predicted_no_answer = (not predicted_answerable)
-
                     ans_counts["ANSWER" if predicted_answerable else "NO_ANSWER"] += 1
 
-                    # update confusion: positive class = answerable
                     if predicted_answerable and gold_answerable:
                         ans_tp += 1
                     elif predicted_answerable and (not gold_answerable):
@@ -354,50 +497,66 @@ def main():
                     else:
                         ans_fn += 1
 
-                # If abstain: chosen outcome computed from gold (not from experts)
                 if predicted_no_answer:
                     out = no_answer_outcome(r)
                     chosen_f1 += float(out["f1"])
                     chosen_em += float(out["em"])
                     chosen_u += float(tradeoff_U(out, tcfg) if args.tradeoff_mode else float(out["f1"]))
                     pick_counts["NO_ANSWER"] += 1
-
                 else:
-                    # 2) Gate decision
-                    if pol is True:
-                        use_rag = True
-                    elif pol is False:
-                        use_rag = False
+                    # 2) Family decision
+                    if args.oracle_gate:
+                        fam = family_oracle_label(ex, tcfg)
                     else:
-                        gmodel = gate["model"]
+                        fam = gate_predict_family(xi, gate_threshold)
+
+                    gate_counts[fam] += 1
+
+                    # gate oracle agreement (only meaningful if not forced policy and not oracle_gate)
+                    if pol is None and (not args.oracle_gate):
+                        fam_or = family_oracle_label(ex, tcfg)
+                        if fam == "rag" and fam_or == "rag":
+                            gate_oracle_TP += 1
+                        elif fam == "no" and fam_or == "no":
+                            gate_oracle_TN += 1
+                        elif fam == "rag" and fam_or == "no":
+                            gate_oracle_FP += 1
+                        else:
+                            gate_oracle_FN += 1
+
+                    # 3) Within-family selection
+                    if args.oracle_selector:
+                        chosen_expert = best_in_family(ex, fam, tcfg)
+                    else:
+                        if fam == "rag":
+                            sm = sel_rag["model"]
+                            experts = sel_rag["experts"]
+                        else:
+                            sm = sel_no["model"]
+                            experts = sel_no["experts"]
+
                         with torch.no_grad():
-                            pred = int(gmodel(xi.unsqueeze(0)).argmax(dim=1).item())
-                        use_rag = (pred == 1)
+                            logits = sm(xi.unsqueeze(0))[0]
+                            probs = torch.softmax(logits, dim=0)
+                            cls = int(torch.argmax(probs).item())
+                            chosen_expert = experts[cls]
 
-                    gate_counts["rag" if use_rag else "no"] += 1
+                            # diagnostics (only for selector-based choice)
+                            p = probs.detach().cpu().numpy()
+                            ent = float(-(p * np.log(np.clip(p, 1e-12, 1.0))).sum())
+                            ent_sum += ent
+                            maxp_sum += float(p.max())
+                            diag_steps += 1
 
-                    # 3) Selector
-                    if use_rag:
-                        sm = sel_rag["model"]
-                        experts = sel_rag["experts"]
-                    else:
-                        sm = sel_no["model"]
-                        experts = sel_no["experts"]
-
-                    with torch.no_grad():
-                        cls = int(sm(xi.unsqueeze(0)).argmax(dim=1).item())
-                    chosen_expert = experts[cls]
                     pick_counts[chosen_expert] += 1
-
                     out = ex[chosen_expert]
                     chosen_f1 += float(out.get("f1", 0.0))
                     chosen_em += float(out.get("em", 0.0))
                     chosen_u += float(tradeoff_U(out, tcfg) if args.tradeoff_mode else float(out.get("f1", 0.0)))
 
-                # ORACLE (best among pool, plus optionally NO_ANSWER for SQuAD)
+                # ORACLE overall (best among pool + NO_ANSWER for SQuAD)
                 best_expert = None
                 best_val = -1e18
-
                 for e in pool:
                     out_e = ex[e]
                     val = tradeoff_U(out_e, tcfg) if args.tradeoff_mode else float(out_e.get("f1", 0.0))
@@ -405,7 +564,6 @@ def main():
                         best_val = val
                         best_expert = e
 
-                # oracle candidate: NO_ANSWER on SQuAD v2
                 if dataset == "squad_v2":
                     out_na = no_answer_outcome(r)
                     val_na = tradeoff_U(out_na, tcfg) if args.tradeoff_mode else float(out_na.get("f1", 0.0))
@@ -413,35 +571,54 @@ def main():
                         best_val = val_na
                         best_expert = "NO_ANSWER"
 
-                if best_expert == "NO_ANSWER":
-                    out_best = no_answer_outcome(r)
-                else:
-                    out_best = ex[best_expert]
-
+                out_best = no_answer_outcome(r) if best_expert == "NO_ANSWER" else ex[best_expert]
                 oracle_f1 += float(out_best.get("f1", 0.0))
                 oracle_em += float(out_best.get("em", 0.0))
                 oracle_u += float(tradeoff_U(out_best, tcfg) if args.tradeoff_mode else float(out_best.get("f1", 0.0)))
 
             n = len(rows)
 
-            # Answerability metrics (if used)
             ans_metrics = None
             if dataset == "squad_v2" and ans_head is not None:
                 eps = 1e-12
                 acc = (ans_tp + ans_tn) / max(1, (ans_tp + ans_tn + ans_fp + ans_fn))
                 prec = ans_tp / max(eps, (ans_tp + ans_fp))
                 rec = ans_tp / max(eps, (ans_tp + ans_fn))
-                f1 = 2 * prec * rec / max(eps, (prec + rec))
+                f1m = 2 * prec * rec / max(eps, (prec + rec))
                 ans_metrics = {
                     "acc": acc,
                     "precision": prec,
                     "recall": rec,
-                    "f1": f1,
-                    "tp": ans_tp, "fp": ans_fp, "tn": ans_tn, "fn": ans_fn,
+                    "f1": f1m,
+                    "tp": ans_tp,
+                    "fp": ans_fp,
+                    "tn": ans_tn,
+                    "fn": ans_fn,
                     "threshold": float(args.ans_threshold),
                 }
 
-            res = {
+            gate_agree = None
+            if pol is None and (not args.oracle_gate):
+                total = gate_oracle_TN + gate_oracle_TP + gate_oracle_FP + gate_oracle_FN
+                if total > 0:
+                    gate_agree = {
+                        "acc": (gate_oracle_TN + gate_oracle_TP) / total,
+                        "conf": {"TN": gate_oracle_TN, "TP": gate_oracle_TP, "FP": gate_oracle_FP, "FN": gate_oracle_FN},
+                    }
+
+            selector_diag = None
+            if diag_steps > 0 and (not args.oracle_selector):
+                selector_diag = {
+                    "mean_entropy": ent_sum / diag_steps,
+                    "mean_maxprob": maxp_sum / diag_steps,
+                    "steps": diag_steps,
+                }
+
+            thr_used = None
+            if pol is None and (not args.oracle_gate):
+                thr_used = default_gate_threshold() if gate_threshold is None else float(gate_threshold)
+
+            return {
                 "chosen_f1": chosen_f1 / n,
                 "chosen_em": chosen_em / n,
                 "chosen_u": chosen_u / n,
@@ -452,21 +629,29 @@ def main():
                 "pick_counts": pick_counts.most_common(10),
                 "ans_counts": dict(ans_counts),
                 "ans_metrics": ans_metrics,
+                "gate_oracle_agreement": gate_agree,
+                "selector_diag": selector_diag,
                 "embed_model": embed_model,
                 "policy": pol,
                 "lambda_cost": (lambda_override if lambda_override is not None else tradeoff_from_cfg(cfg)["lambda_cost"]),
+                "gate_threshold": thr_used,
+                "gate_objective": gate.get("gate_objective", "cls"),
                 "oracle_pool": pool,
             }
-            return res
 
-        if lambdas is None:
-            res = run_eval()
+        # ---------- printing ----------
+        def print_res(tag: str, res: Dict[str, Any]):
             print(
-                f"\n--- {dataset} --- N={len(rows)} "
+                f"\n--- {dataset} --- {tag} N={len(rows)} "
                 f"policy={pol} oracle_policy_aligned={bool(args.oracle_policy_aligned)} "
-                f"tradeoff_mode={bool(args.tradeoff_mode)} use_answerability={bool(args.use_answerability and dataset=='squad_v2')}"
+                f"tradeoff_mode={bool(args.tradeoff_mode)} "
+                f"use_answerability={bool(args.use_answerability and dataset=='squad_v2')} "
+                f"oracle_gate={bool(args.oracle_gate)} oracle_selector={bool(args.oracle_selector)}"
             )
             print(f"embed_model={res['embed_model']}")
+            print(f"gate_objective={res.get('gate_objective')}")
+            if res.get("gate_threshold") is not None:
+                print(f"gate_threshold_used={res['gate_threshold']}")
             print(f"oracle_pool={res['oracle_pool']}")
             if dataset == "squad_v2" and res["ans_metrics"] is not None:
                 print(f"Answerability picks: {res['ans_counts']}")
@@ -477,13 +662,37 @@ def main():
                     f"(thr={am['threshold']:.2f}) | tp={am['tp']} fp={am['fp']} tn={am['tn']} fn={am['fn']}"
                 )
             print(f"Gate picks: {res['gate_counts']}")
+            if res.get("gate_oracle_agreement") is not None:
+                ga = res["gate_oracle_agreement"]
+                print(f"Gate oracle agreement: acc={ga['acc']:.4f} conf={ga['conf']}")
             print(f"Chosen distribution (top): {res['pick_counts']}")
+            if res.get("selector_diag") is not None:
+                sd = res["selector_diag"]
+                print(f"Selector diagnostics: mean_entropy={sd['mean_entropy']:.4f} | mean_maxprob={sd['mean_maxprob']:.4f} | steps={sd['steps']}")
             print(f"Two-stage chosen avg F1={res['chosen_f1']:.4f} | avg EM={res['chosen_em']:.4f} | avg U={res['chosen_u']:.4f}")
             print(f"Oracle     avg F1={res['oracle_f1']:.4f} | avg EM={res['oracle_em']:.4f} | avg U={res['oracle_u']:.4f}\n")
+
+        # default run / sweeps
+        if thr_sweep is not None and (pol is None) and (not args.oracle_gate):
+            print(f"\n--- {dataset} --- sweep gate_threshold ---")
+            for t in thr_sweep:
+                res = run_eval(gate_threshold=t)
+                print(f"thr={t:<6.3f} | chosen_F1={res['chosen_f1']:.4f} oracle_F1={res['oracle_f1']:.4f} | gate={res['gate_counts']}")
+            continue
+
+        if lambdas is None:
+            res = run_eval(gate_threshold=args.gate_threshold)
+            tag = ""
+            if args.gate_threshold is not None:
+                tag = f"(gate_threshold={args.gate_threshold:.3f})"
+            else:
+                if pol is None and (not args.oracle_gate):
+                    tag = f"(gate_threshold=auto:{res.get('gate_threshold')})"
+            print_res(tag, res)
         else:
             print(f"\n--- {dataset} --- sweep lambda_cost ---")
             for lam in lambdas:
-                res = run_eval(lambda_override=lam)
+                res = run_eval(lambda_override=lam, gate_threshold=args.gate_threshold)
                 print(f"lambda={lam:<6} | chosen_U={res['chosen_u']:.4f} oracle_U={res['oracle_u']:.4f} | chosen_F1={res['chosen_f1']:.4f} oracle_F1={res['oracle_f1']:.4f}")
 
     print("\nDONE.")

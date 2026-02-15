@@ -1,4 +1,16 @@
 ﻿# train_router_two_stage.py
+# Implements:
+#  - Gate Δ-to-gold/Δ-utility training (regression or classification)
+#  - Threshold calibration on validation split (sweep) and saving best threshold
+#  - Feature augmentation via precomputed JSONL feature files (retrieval preview + NO_RAG uncertainty probes)
+#  - Selector margin-weighted training (top1-top2 margin inside family)
+#  - Optional selector margin filtering still supported (existing args)
+#
+# Notes:
+#  - This file does NOT run retrieval or LLM probes itself. It *loads precomputed features* from JSONL.
+#  - Feature JSONL format: each line contains {"id": "...", "features": {...}} or {"id": "...", ...flat feature keys...}
+#  - Missing features -> filled with zeros (so you can run baseline with no feature files).
+#
 import argparse
 import json
 from pathlib import Path
@@ -65,7 +77,7 @@ def utility_value(cfg: Dict[str, Any], dataset: str, expert: str, outcome: Dict[
 
 
 # --------------------------
-# Tradeoff-U (for Step 4 "make tradeoff real")
+# Tradeoff-U
 # --------------------------
 
 def tradeoff_from_cfg(cfg: Dict[str, Any]) -> Dict[str, float]:
@@ -183,6 +195,87 @@ class Embedder:
 
 
 # --------------------------
+# Feature loading (retrieval preview + uncertainty probes)
+# --------------------------
+
+def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def load_feature_map(paths: List[Path]) -> Dict[str, Dict[str, float]]:
+    """
+    Loads a mapping: id -> {feature_name: float}
+    Accepts entries like:
+      {"id": "...", "features": {...}}
+    or:
+      {"id": "...", "dense_top1": 0.3, "avg_entropy": 1.2, ...}
+    Last write wins if multiple files provide same feature key.
+    """
+    fmap: Dict[str, Dict[str, float]] = {}
+    for p in paths:
+        if not p.exists():
+            print(f"[WARN] feature file not found: {p}")
+            continue
+        for r in _read_jsonl(p):
+            rid = r.get("id")
+            if rid is None:
+                continue
+            rid = str(rid)
+            feats = r.get("features")
+            if feats is None:
+                # treat as flat
+                feats = {k: v for k, v in r.items() if k not in ("id", "dataset", "question", "features")}
+            if not isinstance(feats, dict):
+                continue
+            if rid not in fmap:
+                fmap[rid] = {}
+            for k, v in feats.items():
+                try:
+                    fmap[rid][str(k)] = float(v)
+                except Exception:
+                    # ignore non-numeric
+                    continue
+    return fmap
+
+
+def build_feature_matrix(
+        rows: List[Dict[str, Any]],
+        fmap: Dict[str, Dict[str, float]],
+        feature_keys: List[str],
+) -> torch.Tensor:
+    n = len(rows)
+    d = len(feature_keys)
+    Xf = torch.zeros((n, d), dtype=torch.float32)
+    if d == 0:
+        return Xf
+    for i, r in enumerate(rows):
+        rid = str(r.get("id", i))
+        feats = fmap.get(rid, {})
+        for j, k in enumerate(feature_keys):
+            if k in feats:
+                Xf[i, j] = float(feats[k])
+    return Xf
+
+
+def standardize_features(Xf: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Z-score standardization for features (helps MLP).
+    Returns standardized Xf and stats to save for inference.
+    """
+    if Xf.numel() == 0 or Xf.size(1) == 0:
+        return Xf, {"mean": [], "std": []}
+    mean = Xf.mean(dim=0, keepdim=True)
+    std = Xf.std(dim=0, keepdim=True).clamp_min(eps)
+    return (Xf - mean) / std, {"mean": mean.squeeze(0).tolist(), "std": std.squeeze(0).tolist()}
+
+
+# --------------------------
 # Dataset wrappers
 # --------------------------
 
@@ -199,15 +292,18 @@ class TensorDatasetXY(Dataset):
 
 
 class TensorDatasetSoft(Dataset):
-    def __init__(self, X: torch.Tensor, y_soft: torch.Tensor):
+    def __init__(self, X: torch.Tensor, y_soft: torch.Tensor, w: Optional[torch.Tensor] = None):
         self.X = X
         self.y = y_soft
+        self.w = w  # per-example weights (selector margin weighting)
 
     def __len__(self):
         return int(self.X.size(0))
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        if self.w is None:
+            return self.X[idx], self.y[idx]
+        return self.X[idx], self.y[idx], self.w[idx]
 
 
 # --------------------------
@@ -291,6 +387,54 @@ def kl_to_prior(mean_probs: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
     return (p * (p.log() - q.log())).sum()
 
 
+def soft_cross_entropy_per_example(logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
+    logp = F.log_softmax(logits, dim=1)
+    return -(target_probs * logp).sum(dim=1)  # [B]
+
+
+def soft_cross_entropy(logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
+    return soft_cross_entropy_per_example(logits, target_probs).mean()
+
+
+# --------------------------
+# Gate: Δ training + threshold calibration
+# --------------------------
+
+def build_gate_delta_targets(
+        cfg: Dict[str, Any],
+        dataset: str,
+        rows: List[Dict[str, Any]],
+        *,
+        use_tradeoff: bool,
+        tcfg: Dict[str, float],
+) -> torch.Tensor:
+    """
+    delta_i = bestRAG - bestNO  (no deadzone filtering)
+    """
+    deltas = []
+    for r in rows:
+        ex = r["experts"]
+        _, br_u = _best_in_pool(cfg, dataset, ex, RAG_EXPERTS, use_tradeoff=use_tradeoff, tcfg=tcfg)
+        _, bn_u = _best_in_pool(cfg, dataset, ex, NO_EXPERTS, use_tradeoff=use_tradeoff, tcfg=tcfg)
+        deltas.append(float(br_u - bn_u))
+    return torch.tensor(deltas, dtype=torch.float32)
+
+
+def build_gate_deadzone_from_deltas(
+        deltas: torch.Tensor,
+        *,
+        gate_delta: float,
+) -> Tuple[List[int], torch.Tensor]:
+    """
+    Keep only where |delta| >= gate_delta, label = 1 if delta>0 else 0.
+    """
+    idx = torch.where(deltas.abs() >= float(gate_delta))[0].tolist()
+    if len(idx) == 0:
+        return [], torch.zeros((0,), dtype=torch.long)
+    y = (deltas[idx] > 0.0).long()
+    return idx, y
+
+
 def train_gate_classifier(
         model: nn.Module,
         X: torch.Tensor,
@@ -326,7 +470,7 @@ def train_gate_classifier(
     for ep in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
-        for xb, yb in tqdm(tr_loader, desc="Batches[gate]", leave=False):
+        for xb, yb in tqdm(tr_loader, desc="Batches[gate-cls]", leave=False):
             xb = xb.to(device)
             yb = yb.to(device)
 
@@ -350,7 +494,7 @@ def train_gate_classifier(
                 correct += int((pred == yb).sum().item())
                 total += int(yb.numel())
         val_acc = correct / max(1, total)
-        print(f"[gate] epoch {ep:02d} | train_loss={train_loss:.4f} | val_acc={val_acc:.4f}")
+        print(f"[gate-cls] epoch {ep:02d} | train_loss={train_loss:.4f} | val_acc={val_acc:.4f}")
 
         if val_acc > best_acc + min_delta:
             best_acc = val_acc
@@ -359,7 +503,7 @@ def train_gate_classifier(
         else:
             bad += 1
             if bad >= patience:
-                print(f"[gate] early stop. best_val_acc={best_acc:.4f}")
+                print(f"[gate-cls] early stop. best_val_acc={best_acc:.4f}")
                 break
 
     if best_state is not None:
@@ -368,15 +512,10 @@ def train_gate_classifier(
     return model, float(best_acc)
 
 
-def soft_cross_entropy(logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
-    logp = F.log_softmax(logits, dim=1)
-    return -(target_probs * logp).sum(dim=1).mean()
-
-
-def train_selector_soft(
+def train_gate_delta_regressor(
         model: nn.Module,
         X: torch.Tensor,
-        y_soft: torch.Tensor,
+        deltas: torch.Tensor,
         *,
         device: str,
         lr: float,
@@ -387,56 +526,39 @@ def train_selector_soft(
         min_delta: float,
         seed: int,
         min_val: int,
-        balanced_sampler: bool,
-        reg_type: str,
-        reg_weight: float,
-        prior: Optional[torch.Tensor],
-        hard_labels_for_sampler: Optional[torch.Tensor],
-) -> Tuple[nn.Module, float]:
+        huber_delta: float,
+) -> Tuple[nn.Module, Dict[str, Any]]:
+    """
+    Train to predict delta (bestRAG - bestNO).
+    We then calibrate a threshold on validation (default 0) by sweeping
+    to maximize accuracy on sign(delta).
+    """
     tr_idx, va_idx = split_train_val_indices(int(X.size(0)), 0.2, seed, min_val=min_val)
-    X_tr, y_tr = X[tr_idx], y_soft[tr_idx]
-    X_va, y_va = X[va_idx], y_soft[va_idx]
+    X_tr, d_tr = X[tr_idx], deltas[tr_idx]
+    X_va, d_va = X[va_idx], deltas[va_idx]
 
     model = model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # robust regression
+    crit = nn.HuberLoss(delta=float(huber_delta))
 
-    if balanced_sampler:
-        if hard_labels_for_sampler is None:
-            raise ValueError("balanced_sampler=True but hard_labels_for_sampler is None")
-        sampler = make_balanced_sampler_from_hard_labels(hard_labels_for_sampler[tr_idx])
-        tr_loader = DataLoader(TensorDatasetSoft(X_tr, y_tr), batch_size=batch_size, sampler=sampler)
-    else:
-        tr_loader = DataLoader(TensorDatasetSoft(X_tr, y_tr), batch_size=batch_size, shuffle=True)
+    tr_loader = DataLoader(TensorDatasetXY(X_tr, d_tr), batch_size=batch_size, shuffle=True)
+    va_loader = DataLoader(TensorDatasetXY(X_va, d_va), batch_size=batch_size, shuffle=False)
 
-    va_loader = DataLoader(TensorDatasetSoft(X_va, y_va), batch_size=batch_size, shuffle=False)
-
-    best_score = -1e18
+    best_v = 1e18
     best_state = None
     bad = 0
 
     for ep in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
-        for xb, tb in tqdm(tr_loader, desc="Batches[sel]", leave=False):
+        for xb, db in tqdm(tr_loader, desc="Batches[gate-delta]", leave=False):
             xb = xb.to(device)
-            tb = tb.to(device)
+            db = db.to(device).float()
 
             opt.zero_grad(set_to_none=True)
-            logits = model(xb)
-            loss = soft_cross_entropy(logits, tb)
-
-            if reg_weight > 0.0 and reg_type != "none":
-                probs = F.softmax(logits, dim=1)
-                if reg_type == "entropy":
-                    loss = loss - float(reg_weight) * entropy_bonus(probs)
-                elif reg_type == "kl":
-                    if prior is None:
-                        raise ValueError("reg_type=kl requires prior")
-                    mean_p = probs.mean(dim=0)
-                    loss = loss + float(reg_weight) * kl_to_prior(mean_p, prior.to(device))
-                else:
-                    raise ValueError(f"Unknown reg_type: {reg_type}")
-
+            pred = model(xb).squeeze(1)
+            loss = crit(pred, db)
             loss.backward()
             opt.step()
             total_loss += float(loss.item()) * xb.size(0)
@@ -444,67 +566,61 @@ def train_selector_soft(
         train_loss = total_loss / max(1, len(tr_loader.dataset))
 
         model.eval()
-        total_vloss = 0.0
+        total_v = 0.0
         with torch.no_grad():
-            for xb, tb in va_loader:
+            for xb, db in va_loader:
                 xb = xb.to(device)
-                tb = tb.to(device)
-                logits = model(xb)
-                vloss = soft_cross_entropy(logits, tb)
-                total_vloss += float(vloss.item()) * xb.size(0)
-        val_loss = total_vloss / max(1, len(va_loader.dataset))
-        val_score = -val_loss
+                db = db.to(device).float()
+                pred = model(xb).squeeze(1)
+                v = crit(pred, db)
+                total_v += float(v.item()) * xb.size(0)
+        val_loss = total_v / max(1, len(va_loader.dataset))
+        print(f"[gate-delta] epoch {ep:02d} | train_loss={train_loss:.4f} | val_huber={val_loss:.4f}")
 
-        print(f"[sel] epoch {ep:02d} | train_loss={train_loss:.4f} | val_softCE={val_loss:.4f}")
-
-        if val_score > best_score + min_delta:
-            best_score = val_score
+        if val_loss < best_v - float(min_delta):
+            best_v = val_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             bad = 0
         else:
             bad += 1
             if bad >= patience:
-                print(f"[sel] early stop. best_val_score={best_score:.4f}")
+                print(f"[gate-delta] early stop. best_val_huber={best_v:.4f}")
                 break
 
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
-    return model, float(best_score)
+
+    # threshold calibration on validation: sweep thresholds over predicted deltas
+    with torch.no_grad():
+        pv = model(X_va.to(device)).squeeze(1).detach().cpu().numpy()
+        dv = d_va.detach().cpu().numpy()
+    yv = (dv > 0).astype(np.int64)
+
+    # candidates: quantiles of predicted deltas + 0
+    thr_cands = np.unique(np.concatenate([np.quantile(pv, np.linspace(0.05, 0.95, 19)), np.array([0.0])]))
+    best_acc = -1.0
+    best_thr = 0.0
+    for thr in thr_cands:
+        pred = (pv > thr).astype(np.int64)
+        acc = float((pred == yv).mean()) if yv.size else 0.0
+        if acc > best_acc:
+            best_acc = acc
+            best_thr = float(thr)
+
+    info = {
+        "best_val_huber": float(best_v),
+        "best_val_sign_acc": float(best_acc),
+        "best_threshold": float(best_thr),
+        "val_size": int(len(va_idx)),
+    }
+    print(f"[gate-delta] calibrated thr={best_thr:.4f} | val_sign_acc={best_acc:.4f}")
+    return model, info
 
 
 # --------------------------
-# Labels: gate + selectors
+# Selector training (soft targets + margin weighting)
 # --------------------------
-
-def build_gate_deadzone(
-        cfg: Dict[str, Any],
-        dataset: str,
-        rows: List[Dict[str, Any]],
-        *,
-        gate_delta: float,
-        use_tradeoff: bool,
-        tcfg: Dict[str, float],
-) -> Tuple[List[int], List[int], List[float]]:
-    idx_used: List[int] = []
-    y_gate: List[int] = []
-    margins: List[float] = []
-
-    for i, r in enumerate(rows):
-        ex = r["experts"]
-        _, br_u = _best_in_pool(cfg, dataset, ex, RAG_EXPERTS, use_tradeoff=use_tradeoff, tcfg=tcfg)
-        _, bn_u = _best_in_pool(cfg, dataset, ex, NO_EXPERTS, use_tradeoff=use_tradeoff, tcfg=tcfg)
-        m = float(br_u - bn_u)
-
-        if abs(m) < float(gate_delta):
-            continue
-
-        idx_used.append(i)
-        y_gate.append(1 if m > 0 else 0)
-        margins.append(m)
-
-    return idx_used, y_gate, margins
-
 
 def soft_targets_from_utils(utils: np.ndarray, tau: float) -> np.ndarray:
     u = utils - np.max(utils)
@@ -567,6 +683,171 @@ def filter_by_margin_window(
         if m >= float(margin_min) and m <= float(margin_max):
             out.append(i)
     return out
+
+
+def selector_margin_weights(
+        cfg: Dict[str, Any],
+        dataset: str,
+        rows: List[Dict[str, Any]],
+        idxs: List[int],
+        pool: List[str],
+        *,
+        use_tradeoff: bool,
+        tcfg: Dict[str, float],
+        margin_scale: float,
+        weight_min: float,
+        weight_max: float,
+) -> torch.Tensor:
+    """
+    Weight examples by top1-top2 margin within the selector pool.
+    w = clip(m / margin_scale, weight_min, weight_max)
+    """
+    w = []
+    ms = float(margin_scale)
+    for i in idxs:
+        ex = rows[i]["experts"]
+        m = _top2_margin_in_pool(cfg, dataset, ex, pool, use_tradeoff=use_tradeoff, tcfg=tcfg)
+        ww = (float(m) / max(1e-8, ms)) if ms > 0 else 1.0
+        ww = float(np.clip(ww, float(weight_min), float(weight_max)))
+        w.append(ww)
+    if not w:
+        return torch.zeros((0,), dtype=torch.float32)
+    return torch.tensor(w, dtype=torch.float32)
+
+
+def train_selector_soft(
+        model: nn.Module,
+        X: torch.Tensor,
+        y_soft: torch.Tensor,
+        *,
+        device: str,
+        lr: float,
+        weight_decay: float,
+        batch_size: int,
+        epochs: int,
+        patience: int,
+        min_delta: float,
+        seed: int,
+        min_val: int,
+        balanced_sampler: bool,
+        reg_type: str,
+        reg_weight: float,
+        prior: Optional[torch.Tensor],
+        hard_labels_for_sampler: Optional[torch.Tensor],
+        example_weights: Optional[torch.Tensor],
+) -> Tuple[nn.Module, float]:
+    tr_idx, va_idx = split_train_val_indices(int(X.size(0)), 0.2, seed, min_val=min_val)
+    X_tr, y_tr = X[tr_idx], y_soft[tr_idx]
+    X_va, y_va = X[va_idx], y_soft[va_idx]
+
+    w_tr = None
+    w_va = None
+    if example_weights is not None and example_weights.numel() == X.size(0):
+        w_tr = example_weights[tr_idx]
+        w_va = example_weights[va_idx]
+
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    if balanced_sampler:
+        if hard_labels_for_sampler is None:
+            raise ValueError("balanced_sampler=True but hard_labels_for_sampler is None")
+        sampler = make_balanced_sampler_from_hard_labels(hard_labels_for_sampler[tr_idx])
+        tr_loader = DataLoader(TensorDatasetSoft(X_tr, y_tr, w_tr), batch_size=batch_size, sampler=sampler)
+    else:
+        tr_loader = DataLoader(TensorDatasetSoft(X_tr, y_tr, w_tr), batch_size=batch_size, shuffle=True)
+
+    va_loader = DataLoader(TensorDatasetSoft(X_va, y_va, w_va), batch_size=batch_size, shuffle=False)
+
+    best_score = -1e18
+    best_state = None
+    bad = 0
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        for batch in tqdm(tr_loader, desc="Batches[sel]", leave=False):
+            if len(batch) == 2:
+                xb, tb = batch
+                wb = None
+            else:
+                xb, tb, wb = batch
+
+            xb = xb.to(device)
+            tb = tb.to(device)
+            if wb is not None:
+                wb = wb.to(device).float()
+
+            opt.zero_grad(set_to_none=True)
+            logits = model(xb)
+
+            per_ex = soft_cross_entropy_per_example(logits, tb)
+            if wb is not None:
+                loss = (per_ex * wb).mean()
+            else:
+                loss = per_ex.mean()
+
+            if reg_weight > 0.0 and reg_type != "none":
+                probs = F.softmax(logits, dim=1)
+                if reg_type == "entropy":
+                    loss = loss - float(reg_weight) * entropy_bonus(probs)
+                elif reg_type == "kl":
+                    if prior is None:
+                        raise ValueError("reg_type=kl requires prior")
+                    mean_p = probs.mean(dim=0)
+                    loss = loss + float(reg_weight) * kl_to_prior(mean_p, prior.to(device))
+                else:
+                    raise ValueError(f"Unknown reg_type: {reg_type}")
+
+            loss.backward()
+            opt.step()
+            total_loss += float(loss.item()) * xb.size(0)
+
+        train_loss = total_loss / max(1, len(tr_loader.dataset))
+
+        model.eval()
+        total_vloss = 0.0
+        with torch.no_grad():
+            for batch in va_loader:
+                if len(batch) == 2:
+                    xb, tb = batch
+                    wb = None
+                else:
+                    xb, tb, wb = batch
+                xb = xb.to(device)
+                tb = tb.to(device)
+                if wb is not None:
+                    wb = wb.to(device).float()
+
+                logits = model(xb)
+                per_ex = soft_cross_entropy_per_example(logits, tb)
+                if wb is not None:
+                    vloss = (per_ex * wb).mean()
+                else:
+                    vloss = per_ex.mean()
+
+                total_vloss += float(vloss.item()) * xb.size(0)
+
+        val_loss = total_vloss / max(1, len(va_loader.dataset))
+        val_score = -val_loss
+
+        print(f"[sel] epoch {ep:02d} | train_loss={train_loss:.4f} | val_softCE={val_loss:.4f}")
+
+        if val_score > best_score + min_delta:
+            best_score = val_score
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                print(f"[sel] early stop. best_val_score={best_score:.4f}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    return model, float(best_score)
 
 
 # --------------------------
@@ -716,9 +997,14 @@ def main():
     ap.add_argument("--patience", type=int, default=10)
     ap.add_argument("--min_delta", type=float, default=2e-4)
 
-    ap.add_argument("--gate_delta", type=float, default=0.02, help="Gate deadzone: skip if abs(margin)<delta")
-    ap.add_argument("--sel_tau", type=float, default=0.2, help="Softmax temperature for utility targets")
+    # Gate Δ training
+    ap.add_argument("--gate_objective", type=str, default="delta_reg", choices=["delta_reg", "cls"],
+                    help="delta_reg: regress Δ=(bestRAG-bestNO) and calibrate threshold; cls: classify sign(Δ) with deadzone.")
+    ap.add_argument("--gate_delta", type=float, default=0.02, help="Gate deadzone for cls: skip if abs(delta)<gate_delta")
+    ap.add_argument("--gate_huber_delta", type=float, default=0.1, help="Huber delta for gate delta regression")
 
+    # Selector targets
+    ap.add_argument("--sel_tau", type=float, default=0.2, help="Softmax temperature for utility targets")
     ap.add_argument("--min_train_selector", type=int, default=20)
     ap.add_argument("--min_val_selector", type=int, default=5)
 
@@ -732,11 +1018,29 @@ def main():
     ap.add_argument("--sel_margin_max", type=float, default=1e9, help="Selector margin window max (top1-top2)")
     ap.add_argument("--print_target_stats", action="store_true", help="Print argmax distribution of selector targets")
 
-    # tradeoff-real training (Step 4)
+    # NEW: selector margin weighting
+    ap.add_argument("--sel_use_margin_weighting", action="store_true",
+                    help="Weight selector loss by (top1-top2)/margin_scale (clipped).")
+    ap.add_argument("--sel_margin_scale", type=float, default=0.05,
+                    help="Scale for margin weights: w = clip(m/scale, wmin, wmax).")
+    ap.add_argument("--sel_weight_min", type=float, default=0.2)
+    ap.add_argument("--sel_weight_max", type=float, default=1.0)
+
+    # tradeoff targets
     ap.add_argument("--tradeoff_mode", action="store_true",
                     help="Use tradeoff_U to compute selector/gate targets instead of legacy utility_value.")
     ap.add_argument("--lambda_cost", type=float, default=None,
                     help="Override cfg.tradeoff.lambda_cost during training when --tradeoff_mode is on.")
+
+    # NEW: feature augmentation (retrieval preview + uncertainty)
+    ap.add_argument("--feature_files", type=str, default=None,
+                    help="Comma-separated JSONL paths to feature files. Each row must have id + numeric features.")
+    ap.add_argument("--feature_keys", type=str, default=None,
+                    help="Comma-separated list of feature keys to use (order matters). Missing keys filled with 0.")
+    ap.add_argument("--standardize_features", action="store_true",
+                    help="Z-score standardize loaded features before concatenation.")
+    ap.add_argument("--save_feature_stats", action="store_true",
+                    help="Save feature standardization stats in checkpoints (recommended if standardize_features).")
 
     # answerability (SQuAD v2 only)
     ap.add_argument("--train_answerability", action="store_true", help="Train answerability head for squad_v2")
@@ -761,6 +1065,15 @@ def main():
     if args.lambda_cost is not None:
         tcfg["lambda_cost"] = float(args.lambda_cost)
 
+    # features config (global, loaded once; ids map works across datasets)
+    feature_paths: List[Path] = []
+    if args.feature_files:
+        feature_paths = [Path(x.strip()) for x in args.feature_files.split(",") if x.strip()]
+    fmap: Dict[str, Dict[str, float]] = load_feature_map(feature_paths) if feature_paths else {}
+    feature_keys: List[str] = []
+    if args.feature_keys:
+        feature_keys = [x.strip() for x in args.feature_keys.split(",") if x.strip()]
+
     for dataset in DATASETS:
         if args.only and dataset != args.only:
             continue
@@ -776,13 +1089,27 @@ def main():
         embed_model = str(embed_models[0])
 
         embedder = Embedder(embed_model, device=args.device)
-        X = embedder.encode(questions, batch_size=args.batch_size).float().cpu()
+        Xq = embedder.encode(questions, batch_size=args.batch_size).float().cpu()
+        in_dim_q = int(Xq.size(1))
+
+        # Load optional features and concatenate
+        Xf = build_feature_matrix(rows, fmap, feature_keys)
+        feat_stats = None
+        if args.standardize_features and Xf.size(1) > 0:
+            Xf, feat_stats = standardize_features(Xf)
+
+        X = Xq
+        if Xf.size(1) > 0:
+            X = torch.cat([Xq, Xf], dim=1)
+
         in_dim = int(X.size(1))
 
         pol = policy_for_dataset(dataset)
         print(f"\n=== {dataset} === total={total} policy={pol} embed={embed_model}")
         if args.tradeoff_mode:
             print(f"[{dataset}] tradeoff_mode=True | lambda_cost={tcfg['lambda_cost']}")
+        if feature_keys:
+            print(f"[{dataset}] features: k={len(feature_keys)} | concat_dim={in_dim_q}+{len(feature_keys)}={in_dim}")
 
         model_dir = out_root / dataset
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -796,7 +1123,7 @@ def main():
             print(f"[squad_v2] answerability labels: answerable_frac={frac_ans:.3f} (1=answerable)")
 
             ans_ckpt, best_acc = train_answerability_head(
-                X=X,
+                X=X,  # NOTE: use same augmented features
                 y=y_ans,
                 in_dim=in_dim,
                 device=args.device,
@@ -816,6 +1143,10 @@ def main():
                 prior_mode=args.ans_prior_mode,
             )
             ans_ckpt["embed_model"] = embed_model
+            ans_ckpt["feature_keys"] = feature_keys
+            if args.save_feature_stats and feat_stats is not None:
+                ans_ckpt["feature_stats"] = feat_stats
+
             ans_path = model_dir / "answerability.pt"
             torch.save(ans_ckpt, ans_path)
             print(f"[squad_v2] saved answerability -> {ans_path} (best_val_acc={best_acc:.4f})")
@@ -826,28 +1157,61 @@ def main():
         gate_path = model_dir / "gate.pt"
 
         if pol is None:
-            idx_gate, y_gate_list, _ = build_gate_deadzone(
+            deltas = build_gate_delta_targets(
                 cfg, dataset, rows,
-                gate_delta=args.gate_delta,
                 use_tradeoff=bool(args.tradeoff_mode),
                 tcfg=tcfg,
             )
 
-            if len(idx_gate) < 200:
-                print(f"[{dataset}] gate: too few examples after deadzone (kept={len(idx_gate)}). "
-                      f"Lower gate_delta or accept weak gate.")
+            if args.gate_objective == "cls":
+                idx_gate, y_gate = build_gate_deadzone_from_deltas(deltas, gate_delta=args.gate_delta)
+                if len(idx_gate) < 200:
+                    print(f"[{dataset}] gate-cls: too few examples after deadzone (kept={len(idx_gate)}). Lower gate_delta.")
+                X_gate = X[idx_gate]
+                frac_rag = float(y_gate.float().mean().item()) if y_gate.numel() else 0.0
+                maj = max(frac_rag, 1 - frac_rag) if y_gate.numel() else 0.0
+                print(f"[{dataset}] gate-cls deadzone kept={len(idx_gate)}/{total} | frac_rag={frac_rag:.3f} | majority≈{maj:.3f}")
 
-            y_gate = torch.tensor(y_gate_list, dtype=torch.long)
-            X_gate = X[idx_gate]
+                gate_model = MLP(in_dim, args.hidden_dim, args.dropout, out_dim=2)
+                if y_gate.numel() > 0:
+                    gate_model, best_acc = train_gate_classifier(
+                        gate_model, X_gate, y_gate,
+                        device=args.device,
+                        lr=args.lr,
+                        weight_decay=args.weight_decay,
+                        batch_size=args.batch_size,
+                        epochs=args.epochs,
+                        patience=args.patience,
+                        min_delta=args.min_delta,
+                        seed=args.seed,
+                        min_val=args.min_val_selector,
+                    )
+                else:
+                    best_acc = 0.0
+                    gate_model.eval()
 
-            frac_rag = float(y_gate.float().mean().item()) if y_gate.numel() else 0.0
-            maj = max(frac_rag, 1 - frac_rag) if y_gate.numel() else 0.0
-            print(f"[{dataset}] gate deadzone kept={len(idx_gate)}/{total} | frac_rag={frac_rag:.3f} | majority≈{maj:.3f}")
+                ckpt = {
+                    "state_dict": gate_model.state_dict(),
+                    "in_dim": in_dim,
+                    "embed_model": embed_model,
+                    "feature_keys": feature_keys,
+                    "gate_objective": "cls",
+                    "gate_delta": float(args.gate_delta),
+                    "best_val_acc": float(best_acc),
+                    "tradeoff_mode": bool(args.tradeoff_mode),
+                    "lambda_cost": float(tcfg["lambda_cost"]),
+                }
+                if args.save_feature_stats and feat_stats is not None:
+                    ckpt["feature_stats"] = feat_stats
 
-            gate_model = MLP(in_dim, args.hidden_dim, args.dropout, out_dim=2)
-            if y_gate.numel() > 0:
-                gate_model, best_acc = train_gate_classifier(
-                    gate_model, X_gate, y_gate,
+                torch.save(ckpt, gate_path)
+                print(f"[{dataset}] saved gate(cls) -> {gate_path} (best_val_acc={best_acc:.4f})")
+
+            else:
+                # delta regression on all rows (no deadzone)
+                gate_model = MLP(in_dim, args.hidden_dim, args.dropout, out_dim=1)
+                gate_model, info = train_gate_delta_regressor(
+                    gate_model, X, deltas,
                     device=args.device,
                     lr=args.lr,
                     weight_decay=args.weight_decay,
@@ -857,26 +1221,32 @@ def main():
                     min_delta=args.min_delta,
                     seed=args.seed,
                     min_val=args.min_val_selector,
+                    huber_delta=float(args.gate_huber_delta),
                 )
-            else:
-                best_acc = 0.0
-                gate_model.eval()
-
-            torch.save(
-                {
+                ckpt = {
                     "state_dict": gate_model.state_dict(),
                     "in_dim": in_dim,
                     "embed_model": embed_model,
-                    "gate_delta": float(args.gate_delta),
-                    "best_val_acc": float(best_acc),
+                    "feature_keys": feature_keys,
+                    "gate_objective": "delta_reg",
+                    "gate_huber_delta": float(args.gate_huber_delta),
+                    "calibrated_threshold": float(info["best_threshold"]),
+                    "best_val_sign_acc": float(info["best_val_sign_acc"]),
+                    "best_val_huber": float(info["best_val_huber"]),
                     "tradeoff_mode": bool(args.tradeoff_mode),
                     "lambda_cost": float(tcfg["lambda_cost"]),
-                },
-                gate_path,
-            )
-            print(f"[{dataset}] saved gate -> {gate_path} (best_val_acc={best_acc:.4f})")
+                }
+                if args.save_feature_stats and feat_stats is not None:
+                    ckpt["feature_stats"] = feat_stats
+
+                torch.save(ckpt, gate_path)
+                print(f"[{dataset}] saved gate(delta_reg) -> {gate_path} (thr={info['best_threshold']:.4f} val_sign_acc={info['best_val_sign_acc']:.4f})")
+
         else:
-            torch.save({"forced_policy": bool(pol), "in_dim": in_dim, "embed_model": embed_model}, gate_path)
+            ckpt = {"forced_policy": bool(pol), "in_dim": in_dim, "embed_model": embed_model, "feature_keys": feature_keys}
+            if args.save_feature_stats and feat_stats is not None:
+                ckpt["feature_stats"] = feat_stats
+            torch.save(ckpt, gate_path)
             print(f"[{dataset}] gate forced={pol}; wrote marker -> {gate_path}")
 
         # -----------------
@@ -895,14 +1265,13 @@ def main():
             idx_rag = []
             idx_no = list(range(total))
         else:
-            for i, r in enumerate(rows):
-                ex = r["experts"]
-                _, br_u = _best_in_pool(cfg, dataset, ex, RAG_EXPERTS, use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg)
-                _, bn_u = _best_in_pool(cfg, dataset, ex, NO_EXPERTS, use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg)
-                m = float(br_u - bn_u)
-                if m >= float(args.gate_delta):
+            # label using delta with deadzone for train split assignment
+            deltas = build_gate_delta_targets(cfg, dataset, rows, use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg)
+            for i in range(total):
+                d = float(deltas[i].item())
+                if d >= float(args.gate_delta):
                     idx_rag.append(i)
-                elif m <= -float(args.gate_delta):
+                elif d <= -float(args.gate_delta):
                     idx_no.append(i)
 
         idx_rag_f = filter_by_margin_window(
@@ -923,7 +1292,6 @@ def main():
         def make_selector_prior(y_hard: torch.Tensor, num_classes: int) -> torch.Tensor:
             if args.sel_prior_mode in ("balanced", "uniform"):
                 return torch.full((num_classes,), 1.0 / float(num_classes), dtype=torch.float32)
-            # empirical:
             counts = torch.bincount(y_hard, minlength=num_classes).float()
             if float(counts.sum().item()) <= 0:
                 return torch.full((num_classes,), 1.0 / float(num_classes), dtype=torch.float32)
@@ -950,6 +1318,17 @@ def main():
             if args.sel_reg_type == "kl" and y_hard.numel() > 0:
                 prior = make_selector_prior(y_hard, len(RAG_EXPERTS))
 
+            ex_w = None
+            if args.sel_use_margin_weighting:
+                ex_w = selector_margin_weights(
+                    cfg, dataset, rows, idx_rag_f, RAG_EXPERTS,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg,
+                    margin_scale=float(args.sel_margin_scale),
+                    weight_min=float(args.sel_weight_min),
+                    weight_max=float(args.sel_weight_max),
+                )
+                print(f"[{dataset}] selector_rag margin-weighting enabled: mean_w={float(ex_w.mean().item() if ex_w.numel() else 0.0):.3f}")
+
             dropout_used = 0.0 if len(idx_rag_f) < 200 else float(args.dropout)
             sel_model = MLP(in_dim, args.hidden_dim, dropout_used, out_dim=len(RAG_EXPERTS))
 
@@ -969,28 +1348,35 @@ def main():
                 reg_weight=float(args.sel_reg_weight),
                 prior=prior,
                 hard_labels_for_sampler=y_hard,
+                example_weights=ex_w,
             )
 
-            torch.save(
-                {
-                    "state_dict": sel_model.state_dict(),
-                    "in_dim": in_dim,
-                    "experts": RAG_EXPERTS,
-                    "embed_model": embed_model,
-                    "sel_tau": float(args.sel_tau),
-                    "trained_on_gate_delta": float(args.gate_delta),
-                    "trained_on_sel_margin_min": float(args.sel_margin_min),
-                    "trained_on_sel_margin_max": float(args.sel_margin_max),
-                    "reg_type": str(args.sel_reg_type),
-                    "reg_weight": float(args.sel_reg_weight),
-                    "prior_mode": str(args.sel_prior_mode),
-                    "prior": (prior.tolist() if prior is not None else None),
-                    "tradeoff_mode": bool(args.tradeoff_mode),
-                    "lambda_cost": float(tcfg["lambda_cost"]),
-                    "best_val_score": float(best_score),
-                },
-                sel_rag_path,
-            )
+            ckpt = {
+                "state_dict": sel_model.state_dict(),
+                "in_dim": in_dim,
+                "experts": RAG_EXPERTS,
+                "embed_model": embed_model,
+                "feature_keys": feature_keys,
+                "sel_tau": float(args.sel_tau),
+                "trained_on_gate_delta": float(args.gate_delta),
+                "trained_on_sel_margin_min": float(args.sel_margin_min),
+                "trained_on_sel_margin_max": float(args.sel_margin_max),
+                "sel_use_margin_weighting": bool(args.sel_use_margin_weighting),
+                "sel_margin_scale": float(args.sel_margin_scale),
+                "sel_weight_min": float(args.sel_weight_min),
+                "sel_weight_max": float(args.sel_weight_max),
+                "reg_type": str(args.sel_reg_type),
+                "reg_weight": float(args.sel_reg_weight),
+                "prior_mode": str(args.sel_prior_mode),
+                "prior": (prior.tolist() if prior is not None else None),
+                "tradeoff_mode": bool(args.tradeoff_mode),
+                "lambda_cost": float(tcfg["lambda_cost"]),
+                "best_val_score": float(best_score),
+            }
+            if args.save_feature_stats and feat_stats is not None:
+                ckpt["feature_stats"] = feat_stats
+
+            torch.save(ckpt, sel_rag_path)
             print(f"[{dataset}] saved selector_rag -> {sel_rag_path} (best_val_score={best_score:.4f})")
         else:
             print(f"[{dataset}] skip selector_rag (count={len(idx_rag_f)})")
@@ -1016,6 +1402,17 @@ def main():
             if args.sel_reg_type == "kl" and y_hard.numel() > 0:
                 prior = make_selector_prior(y_hard, len(NO_EXPERTS))
 
+            ex_w = None
+            if args.sel_use_margin_weighting:
+                ex_w = selector_margin_weights(
+                    cfg, dataset, rows, idx_no_f, NO_EXPERTS,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg,
+                    margin_scale=float(args.sel_margin_scale),
+                    weight_min=float(args.sel_weight_min),
+                    weight_max=float(args.sel_weight_max),
+                )
+                print(f"[{dataset}] selector_no_rag margin-weighting enabled: mean_w={float(ex_w.mean().item() if ex_w.numel() else 0.0):.3f}")
+
             dropout_used = 0.0 if len(idx_no_f) < 200 else float(args.dropout)
             sel_model = MLP(in_dim, args.hidden_dim, dropout_used, out_dim=len(NO_EXPERTS))
 
@@ -1035,28 +1432,35 @@ def main():
                 reg_weight=float(args.sel_reg_weight),
                 prior=prior,
                 hard_labels_for_sampler=y_hard,
+                example_weights=ex_w,
             )
 
-            torch.save(
-                {
-                    "state_dict": sel_model.state_dict(),
-                    "in_dim": in_dim,
-                    "experts": NO_EXPERTS,
-                    "embed_model": embed_model,
-                    "sel_tau": float(args.sel_tau),
-                    "trained_on_gate_delta": float(args.gate_delta),
-                    "trained_on_sel_margin_min": float(args.sel_margin_min),
-                    "trained_on_sel_margin_max": float(args.sel_margin_max),
-                    "reg_type": str(args.sel_reg_type),
-                    "reg_weight": float(args.sel_reg_weight),
-                    "prior_mode": str(args.sel_prior_mode),
-                    "prior": (prior.tolist() if prior is not None else None),
-                    "tradeoff_mode": bool(args.tradeoff_mode),
-                    "lambda_cost": float(tcfg["lambda_cost"]),
-                    "best_val_score": float(best_score),
-                },
-                sel_no_path,
-            )
+            ckpt = {
+                "state_dict": sel_model.state_dict(),
+                "in_dim": in_dim,
+                "experts": NO_EXPERTS,
+                "embed_model": embed_model,
+                "feature_keys": feature_keys,
+                "sel_tau": float(args.sel_tau),
+                "trained_on_gate_delta": float(args.gate_delta),
+                "trained_on_sel_margin_min": float(args.sel_margin_min),
+                "trained_on_sel_margin_max": float(args.sel_margin_max),
+                "sel_use_margin_weighting": bool(args.sel_use_margin_weighting),
+                "sel_margin_scale": float(args.sel_margin_scale),
+                "sel_weight_min": float(args.sel_weight_min),
+                "sel_weight_max": float(args.sel_weight_max),
+                "reg_type": str(args.sel_reg_type),
+                "reg_weight": float(args.sel_reg_weight),
+                "prior_mode": str(args.sel_prior_mode),
+                "prior": (prior.tolist() if prior is not None else None),
+                "tradeoff_mode": bool(args.tradeoff_mode),
+                "lambda_cost": float(tcfg["lambda_cost"]),
+                "best_val_score": float(best_score),
+            }
+            if args.save_feature_stats and feat_stats is not None:
+                ckpt["feature_stats"] = feat_stats
+
+            torch.save(ckpt, sel_no_path)
             print(f"[{dataset}] saved selector_no_rag -> {sel_no_path} (best_val_score={best_score:.4f})")
         else:
             print(f"[{dataset}] skip selector_no_rag (count={len(idx_no_f)})")
