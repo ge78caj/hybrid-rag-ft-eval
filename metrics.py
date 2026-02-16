@@ -377,7 +377,7 @@ def compute_yes_no_maybe_classification(
     return compute_classification_metrics(
         gold_labels=gold_labels,
         pred_labels=pred_labels,
-        target_classes=["yes", "no", "maybe"]
+        target_classes=["yes", "no"]
     )
 
 
@@ -555,25 +555,39 @@ def main():
     """
     # SQuAD v2 files
     squad_files = [
-        # "prediction/ft_squad_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        # "prediction/ft_squad_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        # "prediction/raft_squad_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        # "prediction/raft_squad_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        "prediction/normal_squad_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        "prediction/normal_squad_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/ft_squad_v23500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/ft_squad_v23500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_squad_v23500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_squad_v23500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/normal_squad_v23500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/normal_squad_v23500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
     ]
     
     # PubMedQA files
     pubmedqa_files = [
-        # "prediction/ft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        # "prediction/ft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        # "prediction/raft_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        # "prediction/raft_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
-        # "prediction/normal_pubmedqa_v2_False_Llama-3.2-1B-Instruct_predictions.jsonl",
-        # "prediction/normal_pubmedqa_v2_True_Llama-3.2-1B-Instruct_predictions.jsonl",
+        # "prediction/ft_pubmedqa_v23500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/ft_pubmedqa_v23500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_pubmedqa_v23500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_pubmedqa_v23500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/normal_pubmedqa_v23500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/normal_pubmedqa_v23500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
     ]
     
-    all_files = squad_files + pubmedqa_files
+    hotpotqa_files = [
+        # "prediction/ft_hotpotqa3500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/ft_hotpotqa3500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_hotpotqa3500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/raft_hotpotqa3500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/normal_hotpotqa3500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        # "prediction/normal_hotpotqa3500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+    ]
+    
+    commonsenseqa_files = [
+        "prediction/normal_commonsenseqa3500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        "prediction/normal_commonsenseqa3500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+    ]
+    
+    all_files = squad_files + pubmedqa_files + hotpotqa_files + commonsenseqa_files
     
     for file in all_files:
         if not os.path.exists(file):
@@ -587,6 +601,8 @@ def main():
             dataset_name = "squad_v2"
         elif "pubmedqa" in file.lower():
             dataset_name = "pubmedqa_v2"
+        elif "commonsenseqa" in file.lower():
+            dataset_name = "commonsenseqa"
         else:
             dataset_name = None
         
