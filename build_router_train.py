@@ -40,7 +40,7 @@ def _resolve_prediction_path(pattern_or_path: str) -> Optional[Path]:
     Robust resolution for config entries.
     Supports:
       - exact path: prediction/xxx.jsonl or xxx.jsonl
-      - glob pattern: prediction/*.jsonl or *_predictions.jsonl
+      - glob pattern: prediction/*.jsonl or *_predictions*.jsonl
     Chooses newest mtime if multiple matches.
     """
     s = (pattern_or_path or "").strip()
@@ -213,6 +213,7 @@ def _score_generic(dataset_name: str, gold_answers: List[str], pred_text: str) -
     if "pubmedqa" in name:
         return _score_pubmedqa(gold_answers, pred_text)
 
+    # commonsenseqa + squad_v2 + any other dataset
     return _score_multi_gold(gold_answers, pred_text)
 
 
@@ -222,6 +223,34 @@ def _get_canonical_expert_order(cfg: Dict[str, Any]) -> List[str]:
     if not allowed or not isinstance(allowed, list):
         raise SystemExit("configs/router_config.json must define training.allowed_experts as canonical expert order.")
     return [str(x) for x in allowed]
+
+
+# -----------------------
+# Robust metrics fields
+# -----------------------
+
+def _get_latency_seconds(row: Dict[str, Any]) -> float:
+    """
+    Different pipelines use different keys.
+    Prefer explicit latency fields if present.
+    """
+    for k in ["latency", "latency_s", "time", "time_s", "elapsed", "elapsed_s", "duration", "duration_s"]:
+        if k in row and row[k] is not None:
+            try:
+                return float(row[k])
+            except Exception:
+                pass
+    return 0.0
+
+
+def _get_peak_vram_mb(row: Dict[str, Any]) -> float:
+    for k in ["peak_vram_mb", "vram_mb", "max_vram_mb", "peak_vram", "vram"]:
+        if k in row and row[k] is not None:
+            try:
+                return float(row[k])
+            except Exception:
+                pass
+    return 0.0
 
 
 def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], canonical_order: List[str]) -> None:
@@ -239,7 +268,6 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
             f"ds_cfg.experts={list(experts_cfg.keys())}"
         )
 
-    # Load per-expert prediction files into id->row maps
     expert_maps: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for expert_name in expert_names:
         p = _resolve_prediction_path(experts_cfg[expert_name])
@@ -255,7 +283,6 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
         expert_maps[expert_name] = m
         print(f"[{dataset_name}] expert={expert_name} -> {p} (rows={len(rows)})")
 
-    # intersect ids across all experts
     all_ids: Optional[set] = None
     for m in expert_maps.values():
         ids = set(m.keys())
@@ -272,15 +299,12 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
             base_row = expert_maps[any_expert][rid]
             question = _get_question(base_row)
 
-            # ---- IMPORTANT FIX:
-            # Normalize gold from whichever field exists in prediction files
-            # and ALWAYS WRITE it out as "gold_answer" for downstream scripts.
+            # Read gold from either key
             if "gold_answer" in base_row:
                 gold = _normalize_gold(base_row["gold_answer"])
             elif "gold_answers" in base_row:
                 gold = _normalize_gold(base_row["gold_answers"])
             else:
-                # if you truly have no gold for this row, skip it
                 continue
 
             if not question or not gold:
@@ -289,7 +313,12 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
             expert_outcomes: Dict[str, Any] = {}
             for expert_name in expert_names:
                 r = expert_maps[expert_name][rid]
-                raw_pred = r.get("prediction", "")
+
+                # robust prediction field handling
+                raw_pred = r.get("prediction", None)
+                if raw_pred is None:
+                    raw_pred = r.get("prediction_raw", "")
+
                 pred_extracted = extract_prediction(raw_pred)
                 if pred_extracted == "":
                     pred_extracted = str(raw_pred).strip()
@@ -305,8 +334,8 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
                     "f1": f1,
                     "em": em,
                     "loose_em": loose_em,
-                    "latency": float(r.get("time", 0.0) or 0.0),
-                    "vram_mb": float(r.get("peak_vram_mb", 0.0) or 0.0),
+                    "latency": _get_latency_seconds(r),
+                    "vram_mb": _get_peak_vram_mb(r),
                     "use_rag": bool(r.get("use_rag", False)),
                     "ft_mode": str(r.get("ft_mode", "")),
                 }
@@ -316,10 +345,8 @@ def build_router_train_for_dataset(dataset_name: str, ds_cfg: Dict[str, Any], ca
                 "dataset": dataset_name,
                 "question": question,
 
-                # ✅ write the canonical key expected by your answerability + checks
+                # Canonical gold field + backward compatibility
                 "gold_answer": gold,
-
-                # ✅ keep backward compatibility (optional, but helpful)
                 "gold_answers": gold,
 
                 "experts": expert_outcomes,

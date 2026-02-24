@@ -5,7 +5,6 @@
     "gamma_loose_em": 0.0,
     "lambda_latency": 0.01,
     "mu_vram": 0.0,
-
     "latency_caps_seconds": {
       "default": 3.0,
       "by_dataset": {
@@ -32,11 +31,15 @@
           "base_rag": 5.0,
           "sft_rag": 6.0,
           "raft_rag": 30.0
+        },
+        "commonsenseqa": {
+          "default": 3.0,
+          "base_only": 1.0,
+          "base_rag": 3.0
         }
       }
     }
   },
-  
   "training": {
     "seed": 1337,
     "epochs": 80,
@@ -44,14 +47,13 @@
     "lr": 0.0008,
     "weight_decay": 0.001,
     "hidden_dim": 256,
-    "dropout": 0.10,
+    "dropout": 0.1,
     "tau": 0.7,
     "patience": 12,
     "min_delta": 0.0002,
     "class_balance_power": 0.5,
     "use_margin_weighting": true,
     "margin_m0": 0.25,
-
     "allowed_experts": [
       "base_only",
       "base_rag",
@@ -98,6 +100,16 @@
         "sft_only": "prediction/ft_pubmedqa_v23500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
         "sft_rag": "prediction/ft_pubmedqa_v23500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
         "raft_rag": "prediction/raft_pubmedqa_v23500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl"
+      }
+    },
+    "commonsenseqa": {
+      "router_train_out": "prediction/router_train_commonsenseqa.jsonl",
+      "embed_models": [
+        "sentence-transformers/all-mpnet-base-v2"
+      ],
+      "experts": {
+        "base_only": "prediction/normal_commonsenseqa3500_False_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl",
+        "base_rag": "prediction/normal_commonsenseqa3500_True_Llama-3.2-1B-Instruct_predictions_add_unique_prompt.jsonl"
       }
     }
   }
