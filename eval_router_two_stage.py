@@ -1,26 +1,4 @@
-﻿# eval_router_two_stage.py
-#
-# FIXES for Ryo requirements (Problems 2 & 3):
-#
-# (2) PubMed gate must actually make retrieval decision:
-#     - Add --pubmed_policy {forced,none} (default=forced for backward compat)
-#     - If pubmed_policy=none, PubMed is NOT forced to RAG in family decision.
-#     - If --use_shared_gate is enabled (PubMed+CSQA shared gate), we also do NOT force PubMed.
-#
-# (3) Stage-2 passage embeddings:
-#     - Keep --use_passage_embeddings; when enabled, we can build passage embeddings.
-#     - Robust dim-handling: each checkpoint (gate / selector / shared gate) may have different in_dim.
-#       We build base Xq + features Xf (+ optional passage Xp), and then FEED each model the slice it expects:
-#         * if ckpt_in_dim == Dq + Df -> no passages
-#         * if ckpt_in_dim == Dq + Df + Dq -> with passages
-#       This prevents the “mat1 1x791 vs 1559x256” crash and allows mixed checkpoints in combined eval.
-#     - If a checkpoint requires passages but --use_passage_embeddings is OFF, we raise a clear error.
-#
-# NOTE:
-# - This file does NOT require changing other files, as we infer “passages used” from ckpt["in_dim"].
-# - You must have trained checkpoints for each dataset you evaluate (gate + selector_rag at minimum).
-#
-import argparse
+﻿import argparse
 import json
 import re
 from pathlib import Path
@@ -37,10 +15,11 @@ CFG_PATH = Path("configs/router_config.json")
 PRED_DIR = Path("prediction")
 
 CANON_RAG_EXPERTS = ["base_rag", "sft_rag", "raft_rag"]
-CANON_NO_EXPERTS  = ["base_only", "sft_only"]
+CANON_NO_EXPERTS = ["base_only", "sft_only"]
 
 DATASETS = ["hotpotqa", "squad_v2", "pubmedqa_v2", "commonsenseqa"]
 SHARED_GATE_NAME = "combined_pubmed_csqa_gate"
+SELECTOR_CMP_PREFIX = "selcmp__"
 
 
 # --------------------------
@@ -148,14 +127,10 @@ def should_use_shared_gate_for_dataset(ds: str) -> bool:
 
 
 def policy_for_dataset(dataset: str, *, pubmed_policy: str) -> Optional[bool]:
-    # Ryo: always use RAG for these datasets
     if dataset in ("hotpotqa", "squad_v2"):
         return True
-
-    # PubMed controlled separately (shared gate recommended)
     if dataset == "pubmedqa_v2":
         return True if pubmed_policy == "forced" else None
-
     return None
 
 
@@ -180,21 +155,20 @@ def load_feature_map(paths: List[Path]) -> Dict[str, Dict[str, float]]:
             print(f"[WARN] feature file not found: {p}")
             continue
         for r in _read_jsonl(p):
-            rid = r.get("id")
-            if rid is None:
+            rid_raw = r.get("orig_id", r.get("id"))
+            if rid_raw is None:
                 continue
-            rid = str(rid)
+            rid_raw = str(rid_raw)
 
-            # Prefer dataset-aware keying if possible (prevents cross-dataset id collisions)
             ds = r.get("dataset")
             if ds is not None:
-                rid_key = f"{str(ds)}::{rid}"
+                rid_key = f"{str(ds)}::{rid_raw}"
             else:
-                rid_key = rid
+                rid_key = rid_raw
 
             feats = r.get("features")
             if feats is None:
-                feats = {k: v for k, v in r.items() if k not in ("id", "dataset", "question", "features")}
+                feats = {k: v for k, v in r.items() if k not in ("id", "orig_id", "dataset", "question", "features")}
             if not isinstance(feats, dict):
                 continue
 
@@ -206,11 +180,18 @@ def load_feature_map(paths: List[Path]) -> Dict[str, Dict[str, float]]:
                     continue
     return fmap
 
+
 def infer_feature_keys_from_map(fmap: Dict[str, Dict[str, float]]) -> List[str]:
     keys = set()
     for _, feats in fmap.items():
         keys.update(map(str, feats.keys()))
     return sorted(keys)
+
+
+def split_feature_keys_for_models(feature_keys: List[str]) -> Tuple[List[str], List[str]]:
+    gate_keys = [k for k in feature_keys if not str(k).startswith(SELECTOR_CMP_PREFIX)]
+    selector_keys = list(feature_keys)
+    return gate_keys, selector_keys
 
 
 def build_feature_matrix(rows: List[Dict[str, Any]], fmap: Dict[str, Dict[str, float]], feature_keys: List[str]) -> torch.Tensor:
@@ -221,7 +202,7 @@ def build_feature_matrix(rows: List[Dict[str, Any]], fmap: Dict[str, Dict[str, f
         return Xf
     for i, r in enumerate(rows):
         rid = str(r.get("id", i))
-        ds = str(r.get("dataset", ""))  # should exist
+        ds = str(r.get("dataset", ""))
         rid_key = f"{ds}::{rid}" if ds else rid
         feats = fmap.get(rid_key, {})
         for j, k in enumerate(feature_keys):
@@ -235,7 +216,9 @@ def apply_feature_standardization(Xf: torch.Tensor, stats: Dict[str, Any], eps: 
         return Xf
     mean = stats.get("mean", None)
     std = stats.get("std", None)
-    if not mean or not std:
+    if mean is None or std is None:
+        return Xf
+    if len(mean) == 0 or len(std) == 0:
         return Xf
     mean_t = torch.tensor(mean, dtype=torch.float32, device=Xf.device).view(1, -1)
     std_t = torch.tensor(std, dtype=torch.float32, device=Xf.device).view(1, -1).clamp_min(eps)
@@ -252,12 +235,20 @@ def standardize_features_fit(Xf: torch.Tensor, eps: float = 1e-8) -> Tuple[torch
     std = Xf.std(dim=0, keepdim=True).clamp_min(eps)
     return (Xf - mean) / std, {"mean": mean.squeeze(0).tolist(), "std": std.squeeze(0).tolist()}
 
-
+def report_feature_coverage(tag: str, Xf: torch.Tensor) -> None:
+    if Xf.numel() == 0 or Xf.size(1) == 0:
+        print(f"[FEAT-CHECK][{tag}] no feature columns")
+        return
+    matched_rows = int((Xf.abs().sum(dim=1) > 0).sum().item())
+    mean_active = float((Xf != 0).sum(dim=1).float().mean().item())
+    print(f"[FEAT-CHECK][{tag}] matched_rows={matched_rows}/{Xf.size(0)} mean_active_feats={mean_active:.2f}")
+    
 # --------------------------
-# Passage parsing + embeddings (Problem 3)
+# Passage parsing + embeddings
 # --------------------------
 
 _DOC_RE = re.compile(r"<DOCUMENT>(.*?)</DOCUMENT>", re.DOTALL)
+
 
 def extract_docs_from_prediction_raw(pred_raw: str, max_docs: int, max_chars: int) -> List[str]:
     if not pred_raw:
@@ -280,11 +271,6 @@ def build_passage_embedding_matrix(
         max_chars: int = 1200,
         batch_size_docs: int = 64,
 ) -> torch.Tensor:
-    """
-    Returns [N, Dq] mean(doc_embeds) for docs in experts[source_expert].prediction_raw.
-    If no docs exist for a row => zeros. If no docs exist at all => zeros.
-    """
-    # Determine embedding dim Dq
     dummy = embedder.encode(["dummy"], batch_size=1).float().to(device)
     d = int(dummy.shape[-1])
 
@@ -318,6 +304,42 @@ def build_passage_embedding_matrix(
 # Checkpoint loading
 # --------------------------
 
+def _infer_hidden_dim_from_state_dict(sd: Dict[str, torch.Tensor]) -> int:
+    return int(sd["net.0.weight"].shape[0])
+
+
+def _pick_first_valid_expert(ckpt: Dict[str, Any], experts: List[str], keys: List[str]) -> Optional[str]:
+    for key in keys:
+        val = ckpt.get(key, None)
+        if isinstance(val, str) and val in experts:
+            return val
+    return None
+
+
+def _infer_fallback_expert_from_ckpt(ckpt: Dict[str, Any], experts: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    priority_keys = [
+        "fallback_best_constant_expert",
+        "best_constant_expert",
+        "constant_fallback_expert",
+        "fallback_expert",
+        "best_global_expert",
+        "val_best_constant_expert",
+    ]
+    val = _pick_first_valid_expert(ckpt, experts, priority_keys)
+    if val is not None:
+        for k in priority_keys:
+            if ckpt.get(k, None) == val:
+                return val, k
+
+    prior = ckpt.get("prior", None)
+    if isinstance(prior, list) and len(prior) == len(experts):
+        arr = np.asarray(prior, dtype=np.float32)
+        if np.isfinite(arr).all() and (float(arr.max()) - float(arr.min()) > 1e-8):
+            return experts[int(arr.argmax())], "prior_argmax"
+
+    return None, None
+
+
 def load_gate(model_dir: Path, device: str, hidden_dim: int, dropout: float) -> Dict[str, Any]:
     p = model_dir / "gate.pt"
     if not p.exists():
@@ -339,10 +361,12 @@ def load_gate(model_dir: Path, device: str, hidden_dim: int, dropout: float) -> 
 
     in_dim = int(ckpt["in_dim"])
     gate_objective = str(ckpt.get("gate_objective", "cls"))
+    sd = ckpt["state_dict"]
+    hidden_dim_ckpt = _infer_hidden_dim_from_state_dict(sd)
 
     if gate_objective == "delta_reg":
-        model = MLP(in_dim, hidden_dim, dropout, out_dim=1)
-        model.load_state_dict(ckpt["state_dict"])
+        model = MLP(in_dim, hidden_dim_ckpt, dropout, out_dim=1)
+        model.load_state_dict(sd)
         model.to(device).eval()
         return {
             "forced_policy": None,
@@ -356,8 +380,8 @@ def load_gate(model_dir: Path, device: str, hidden_dim: int, dropout: float) -> 
             "raw_ckpt": ckpt,
         }
 
-    model = MLP(in_dim, hidden_dim, dropout, out_dim=2)
-    model.load_state_dict(ckpt["state_dict"])
+    model = MLP(in_dim, hidden_dim_ckpt, dropout, out_dim=2)
+    model.load_state_dict(sd)
     model.to(device).eval()
     return {
         "forced_policy": None,
@@ -379,9 +403,28 @@ def load_selector(model_dir: Path, which: str, device: str, hidden_dim: int, dro
     ckpt = torch.load(p, map_location="cpu", weights_only=False)
     in_dim = int(ckpt["in_dim"])
     experts = list(ckpt["experts"])
-    model = MLP(in_dim, hidden_dim, dropout, out_dim=len(experts))
-    model.load_state_dict(ckpt["state_dict"])
+    sd = ckpt["state_dict"]
+    hidden_dim_ckpt = _infer_hidden_dim_from_state_dict(sd)
+    model = MLP(in_dim, hidden_dim_ckpt, dropout, out_dim=len(experts))
+    model.load_state_dict(sd)
     model.to(device).eval()
+
+    fallback_expert, fallback_source = _infer_fallback_expert_from_ckpt(ckpt, experts)
+
+    use_constant_selector = bool(ckpt.get("use_constant_selector", False))
+    constant_selector_expert = None
+    if use_constant_selector:
+        constant_selector_expert = _pick_first_valid_expert(
+            ckpt,
+            experts,
+            [
+                "fallback_best_constant_expert",
+                "best_constant_expert",
+                "val_best_constant_expert",
+                "fallback_expert",
+            ],
+        )
+
     return {
         "model": model,
         "experts": experts,
@@ -389,12 +432,16 @@ def load_selector(model_dir: Path, which: str, device: str, hidden_dim: int, dro
         "embed_model": ckpt.get("embed_model"),
         "feature_keys": ckpt.get("feature_keys", []),
         "feature_stats": ckpt.get("feature_stats", None),
+        "fallback_expert": fallback_expert,
+        "fallback_source": fallback_source,
+        "use_constant_selector": use_constant_selector,
+        "constant_selector_expert": constant_selector_expert,
         "raw_ckpt": ckpt,
     }
 
 
 # --------------------------
-# Utility/tradeoff (from router_config.json utility)
+# Utility / tradeoff
 # --------------------------
 
 def tradeoff_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -459,22 +506,18 @@ def parse_csv_floats(s: Optional[str]) -> Optional[List[float]]:
 
 
 # --------------------------
-# Dim-safe model input assembly (Problem 3 robustness)
+# Dim-safe model input assembly
 # --------------------------
 
 def assemble_model_inputs(
         *,
-        Xq: torch.Tensor,   # [N, Dq]
-        Xf: torch.Tensor,   # [N, Df] or [N,0]
-        Xp: Optional[torch.Tensor],  # [N, Dq] or None
+        Xq: torch.Tensor,
+        Xf: torch.Tensor,
+        Xp: Optional[torch.Tensor],
         expected_in_dim: int,
         model_name: str,
         require_passages_ok: bool,
 ) -> torch.Tensor:
-    """
-    Return [N, expected_in_dim] by concatenating the needed components.
-    We assume passage embeddings (if used) have dim == Dq.
-    """
     Dq = int(Xq.size(1))
     Df = int(Xf.size(1))
     base = Dq + Df
@@ -490,7 +533,6 @@ def assemble_model_inputs(
                     f"[DIM] {model_name} expects passages (in_dim={expected_in_dim} == {base}+{Dq}), "
                     f"but passage embeddings are not available. Re-run eval with --use_passage_embeddings."
                 )
-            # Should not happen if require_passages_ok=True implies Xp provided; keep safe.
             raise SystemExit(f"[DIM] {model_name} expects passages but Xp is None.")
         return torch.cat([Xq, Xf, Xp], dim=1) if Df > 0 else torch.cat([Xq, Xp], dim=1)
 
@@ -525,17 +567,18 @@ def run_eval_dataset(
         standardize_features_flag: bool,
         use_shared_gate: bool,
         shared_gate: Optional[Dict[str, Any]],
-        pubmed_policy: str,  # forced|none
+        pubmed_policy: str,
         use_passage_embeddings: bool,
         passage_source_expert: str,
         passage_max_docs: int,
         passage_max_chars: int,
+        selector_fallback: bool,
+        selector_conf_threshold: float,
 ) -> Dict[str, Any]:
 
     model_dir = model_root / dataset
 
     pol = policy_for_dataset(dataset, pubmed_policy=pubmed_policy)
-    # If shared gate is enabled for PubMed/CSQA, we do NOT force policy in family decision
     if use_shared_gate and shared_gate is not None and should_use_shared_gate_for_dataset(dataset):
         pol_for_family = None
     else:
@@ -545,29 +588,11 @@ def run_eval_dataset(
 
     gate = load_gate(model_dir, device, hidden_dim, dropout)
     sel_rag = load_selector(model_dir, "rag", device, hidden_dim, dropout)
-    sel_no  = load_selector(model_dir, "no_rag", device, hidden_dim, dropout)
+    sel_no = load_selector(model_dir, "no_rag", device, hidden_dim, dropout)
 
-    # Minimal sanity: selector_rag must exist (all our routers can always pick RAG experts).
     if sel_rag is None:
         raise SystemExit(f"[{dataset}] missing selector_rag.pt in {model_dir}")
 
-    # feature keys: prefer CLI > ckpt > infer
-    ckpt_feature_keys = (
-            (gate.get("feature_keys") or [])
-            or (sel_rag.get("feature_keys") if sel_rag else [])
-            or (sel_no.get("feature_keys") if sel_no else [])
-            or []
-    )
-    if feature_keys_cli is not None:
-        feature_keys = feature_keys_cli
-    elif ckpt_feature_keys:
-        feature_keys = list(ckpt_feature_keys)
-    elif feature_fmap:
-        feature_keys = infer_feature_keys_from_map(feature_fmap)
-    else:
-        feature_keys = []
-
-    # embed model: prefer dataset ckpts
     embed_model = (
             gate.get("embed_model")
             or (sel_rag.get("embed_model") if sel_rag else None)
@@ -575,37 +600,71 @@ def run_eval_dataset(
             or "sentence-transformers/all-mpnet-base-v2"
     )
 
-    # embed questions
     questions = [r["question"] for r in rows]
     embedder = Embedder(embed_model, device=device)
-    Xq = embedder.encode(questions, batch_size=batch_size).float()  # [N, Dq] on device
+    Xq = embedder.encode(questions, batch_size=batch_size).float()
 
-    # numeric features
-    feat_stats_used = None
-    if feature_keys:
-        Xf = build_feature_matrix(rows, feature_fmap, feature_keys).to(device)
-        if standardize_features_flag and Xf.size(1) > 0:
-            stats = gate.get("feature_stats") or (sel_rag.get("feature_stats") if sel_rag else None) or (sel_no.get("feature_stats") if sel_no else None)
-            if stats:
-                Xf = apply_feature_standardization(Xf, stats)
-                feat_stats_used = "ckpt"
-            else:
-                Xf, _ = standardize_features_fit(Xf)
-                feat_stats_used = "fit_eval"
-    else:
-        Xf = torch.zeros((len(rows), 0), dtype=torch.float32, device=device)
-
-    # Passage embeddings are built once per dataset IF enabled.
-    # We will only feed them to models whose ckpt in_dim indicates they need them.
     Xp = None
     if use_passage_embeddings:
         Xp = build_passage_embedding_matrix(
-            rows, embedder, device,
+            rows,
+            embedder,
+            device,
             source_expert=passage_source_expert,
             max_docs=passage_max_docs,
             max_chars=passage_max_chars,
             batch_size_docs=batch_size,
         )
+
+    cli_gate_keys = None
+    cli_selector_keys = None
+    if feature_keys_cli is not None:
+        cli_gate_keys, cli_selector_keys = split_feature_keys_for_models(feature_keys_cli)
+
+    feature_stats_used = {}
+    feature_keys_used = {}
+
+    def build_model_feature_block(model_obj: Optional[Dict[str, Any]], model_name: str, *, default_selector: bool) -> torch.Tensor:
+        if model_obj is None:
+            return torch.zeros((len(rows), 0), dtype=torch.float32, device=device)
+
+        if feature_keys_cli is not None:
+            keys = cli_selector_keys if default_selector else cli_gate_keys
+        else:
+            keys = list(model_obj.get("feature_keys") or [])
+            if not keys and feature_fmap:
+                inferred = infer_feature_keys_from_map(feature_fmap)
+                if default_selector:
+                    keys = list(inferred)
+                else:
+                    keys, _ = split_feature_keys_for_models(inferred)
+
+        feature_keys_used[model_name] = list(keys)
+
+        if not keys:
+            feature_stats_used[model_name] = None
+            return torch.zeros((len(rows), 0), dtype=torch.float32, device=device)
+
+        Xf = build_feature_matrix(rows, feature_fmap, keys).to(device)
+        report_feature_coverage(f"{dataset}/{model_name}_raw", Xf)
+        if standardize_features_flag and Xf.size(1) > 0:
+            stats = model_obj.get("feature_stats")
+            if stats:
+                Xf = apply_feature_standardization(Xf, stats)
+                feature_stats_used[model_name] = "ckpt"
+            else:
+                Xf, _ = standardize_features_fit(Xf)
+                feature_stats_used[model_name] = "fit_eval"
+        else:
+            feature_stats_used[model_name] = None
+        return Xf
+
+    used_shared = bool(use_shared_gate and shared_gate is not None and should_use_shared_gate_for_dataset(dataset))
+
+    Xf_gate = build_model_feature_block(gate, "gate", default_selector=False)
+    Xf_sel_rag = build_model_feature_block(sel_rag, "selector_rag", default_selector=True)
+    Xf_sel_no = build_model_feature_block(sel_no, "selector_no_rag", default_selector=True) if sel_no is not None else None
+    Xf_shared = build_model_feature_block(shared_gate, "shared_gate", default_selector=False) if used_shared else None
 
     def default_gate_threshold(gate_obj: Dict[str, Any]) -> float:
         if gate_threshold is not None:
@@ -613,7 +672,6 @@ def run_eval_dataset(
         return float(gate_obj.get("calibrated_threshold", 0.5) or 0.5)
 
     def oracle_pool_for_dataset() -> List[str]:
-        # oracle_policy_aligned should respect CURRENT policy choice (pubmed_policy flag)
         if oracle_policy_aligned and pol is not None:
             return rag_pool_ds if pol is True else no_pool_ds
         return rag_pool_ds + no_pool_ds
@@ -647,20 +705,21 @@ def run_eval_dataset(
         vn = tradeoff_U(ex[bn], tcfg, dataset, bn) if tradeoff_mode else float(ex[bn].get("f1", 0.0))
         return "rag" if vr > vn else "no"
 
-    # Prepare per-model input matrices with correct dims (Problem 3 fix)
-    used_shared = bool(use_shared_gate and shared_gate is not None and should_use_shared_gate_for_dataset(dataset))
-
     X_gate = None
     if gate.get("gate_objective") != "forced":
         X_gate = assemble_model_inputs(
-            Xq=Xq, Xf=Xf, Xp=Xp,
+            Xq=Xq,
+            Xf=Xf_gate,
+            Xp=Xp,
             expected_in_dim=int(gate["in_dim"]),
             model_name=f"{dataset}/gate",
             require_passages_ok=bool(use_passage_embeddings),
         )
 
     X_sel_rag = assemble_model_inputs(
-        Xq=Xq, Xf=Xf, Xp=Xp,
+        Xq=Xq,
+        Xf=Xf_sel_rag,
+        Xp=Xp,
         expected_in_dim=int(sel_rag["in_dim"]),
         model_name=f"{dataset}/selector_rag",
         require_passages_ok=bool(use_passage_embeddings),
@@ -669,7 +728,9 @@ def run_eval_dataset(
     X_sel_no = None
     if sel_no is not None:
         X_sel_no = assemble_model_inputs(
-            Xq=Xq, Xf=Xf, Xp=Xp,
+            Xq=Xq,
+            Xf=Xf_sel_no,
+            Xp=Xp,
             expected_in_dim=int(sel_no["in_dim"]),
             model_name=f"{dataset}/selector_no_rag",
             require_passages_ok=bool(use_passage_embeddings),
@@ -678,14 +739,15 @@ def run_eval_dataset(
     X_shared = None
     if used_shared:
         X_shared = assemble_model_inputs(
-            Xq=Xq, Xf=Xf, Xp=Xp,
+            Xq=Xq,
+            Xf=Xf_shared,
+            Xp=Xp,
             expected_in_dim=int(shared_gate["in_dim"]),
             model_name=f"{SHARED_GATE_NAME}/gate(shared)",
             require_passages_ok=bool(use_passage_embeddings),
         )
 
     def gate_predict_family(i: int) -> str:
-        # Shared gate override (PubMed/CSQA)
         if used_shared:
             sg = shared_gate
             thr = default_gate_threshold(sg)
@@ -697,13 +759,11 @@ def run_eval_dataset(
                 p_rag = float(probs[1].item())
                 return "rag" if p_rag >= thr else "no"
 
-        # Forced policy for family decision
         if pol_for_family is True:
             return "rag"
         if pol_for_family is False:
             return "no"
 
-        # Normal dataset gate
         if gate.get("gate_objective") == "forced":
             forced = gate.get("forced_policy")
             return "rag" if forced else "no"
@@ -731,13 +791,15 @@ def run_eval_dataset(
     maxp_sum = 0.0
     diag_steps = 0
 
+    fallback_counts = Counter()
+    constant_selector_counts = Counter()
+
     for i in tqdm(range(len(rows)), desc=f"Eval {dataset}"):
         r = rows[i]
         ex = r["experts"]
 
         rag_pool_row, no_pool_row = pools_for_row(ex, rag_pool_ds, no_pool_ds)
 
-        # 1) family decision
         if oracle_gate:
             fam = family_oracle_label(ex)
         else:
@@ -745,7 +807,6 @@ def run_eval_dataset(
 
         gate_counts[fam] += 1
 
-        # gate oracle agreement (meaningful only when family not forced)
         if pol_for_family is None and (not oracle_gate):
             fam_or = family_oracle_label(ex)
             if fam == "rag" and fam_or == "rag":
@@ -757,42 +818,67 @@ def run_eval_dataset(
             else:
                 gate_oracle_FN += 1
 
-        # 2) within-family selection
         if oracle_selector:
             chosen_expert = best_in_family(ex, fam)
         else:
             if fam == "rag":
-                sm = sel_rag["model"]
-                experts = sel_rag["experts"]
-                xi = X_sel_rag[i]
-                with torch.no_grad():
-                    logits = sm(xi.unsqueeze(0))[0]
-                    probs = torch.softmax(logits, dim=0)
-                    cls = int(torch.argmax(probs).item())
-                    chosen_expert = experts[cls]
-                    p = probs.detach().cpu().numpy()
-                    ent_sum += float(-(p * np.log(np.clip(p, 1e-12, 1.0))).sum())
-                    maxp_sum += float(p.max())
-                    diag_steps += 1
-            else:
-                # if selector_no_rag missing, fallback deterministically
-                if sel_no is None or X_sel_no is None:
-                    chosen_expert = best_in_family(ex, "no")
+                const_expert = sel_rag.get("constant_selector_expert")
+                if sel_rag.get("use_constant_selector") and isinstance(const_expert, str) and const_expert in ex:
+                    chosen_expert = const_expert
+                    constant_selector_counts[f"rag->{const_expert}"] += 1
                 else:
-                    sm = sel_no["model"]
-                    experts = sel_no["experts"]
-                    xi = X_sel_no[i]
+                    sm = sel_rag["model"]
+                    experts = sel_rag["experts"]
+                    xi = X_sel_rag[i]
                     with torch.no_grad():
                         logits = sm(xi.unsqueeze(0))[0]
                         probs = torch.softmax(logits, dim=0)
                         cls = int(torch.argmax(probs).item())
                         chosen_expert = experts[cls]
-                        p = probs.detach().cpu().numpy()
-                        ent_sum += float(-(p * np.log(np.clip(p, 1e-12, 1.0))).sum())
-                        maxp_sum += float(p.max())
-                        diag_steps += 1
 
-        # safety fallback if chosen expert missing in row
+                        p = probs.detach().cpu().numpy()
+                        maxp = float(p.max())
+
+                        if selector_fallback and maxp < float(selector_conf_threshold):
+                            fb = sel_rag.get("fallback_expert")
+                            if isinstance(fb, str) and fb in ex:
+                                chosen_expert = fb
+                                fallback_counts[f"rag->{fb}"] += 1
+
+                        ent_sum += float(-(p * np.log(np.clip(p, 1e-12, 1.0))).sum())
+                        maxp_sum += maxp
+                        diag_steps += 1
+            else:
+                if sel_no is None or X_sel_no is None:
+                    chosen_expert = best_in_family(ex, "no")
+                else:
+                    const_expert = sel_no.get("constant_selector_expert")
+                    if sel_no.get("use_constant_selector") and isinstance(const_expert, str) and const_expert in ex:
+                        chosen_expert = const_expert
+                        constant_selector_counts[f"no->{const_expert}"] += 1
+                    else:
+                        sm = sel_no["model"]
+                        experts = sel_no["experts"]
+                        xi = X_sel_no[i]
+                        with torch.no_grad():
+                            logits = sm(xi.unsqueeze(0))[0]
+                            probs = torch.softmax(logits, dim=0)
+                            cls = int(torch.argmax(probs).item())
+                            chosen_expert = experts[cls]
+
+                            p = probs.detach().cpu().numpy()
+                            maxp = float(p.max())
+
+                            if selector_fallback and maxp < float(selector_conf_threshold):
+                                fb = sel_no.get("fallback_expert")
+                                if isinstance(fb, str) and fb in ex:
+                                    chosen_expert = fb
+                                    fallback_counts[f"no->{fb}"] += 1
+
+                            ent_sum += float(-(p * np.log(np.clip(p, 1e-12, 1.0))).sum())
+                            maxp_sum += maxp
+                            diag_steps += 1
+
         if chosen_expert not in ex:
             fallback_pool = (rag_pool_row if fam == "rag" else no_pool_row) or (rag_pool_row + no_pool_row)
             chosen_expert = fallback_pool[0] if fallback_pool else list(ex.keys())[0]
@@ -803,7 +889,6 @@ def run_eval_dataset(
         chosen_em += float(out.get("em", 0.0))
         chosen_u += float(tradeoff_U(out, tcfg, dataset, chosen_expert) if tradeoff_mode else float(out.get("f1", 0.0)))
 
-        # ORACLE overall (best among pool + NO_ANSWER for SQuAD)
         best_expert = None
         best_val = -1e18
         pool_row = [e for e in pool if e in ex] or list(ex.keys())
@@ -857,14 +942,11 @@ def run_eval_dataset(
         else:
             thr_used = float(gate_threshold if gate_threshold is not None else gate.get("calibrated_threshold", 0.5))
 
-    # Report whether this dataset's ckpts actually used passages (by in_dim)
     Dq = int(Xq.size(1))
-    Df = int(Xf.size(1))
-    base = Dq + Df
-    used_pass_gate = (gate.get("in_dim") == base + Dq) if gate.get("in_dim") else False
-    used_pass_rag  = (sel_rag.get("in_dim") == base + Dq) if sel_rag else False
-    used_pass_no   = (sel_no.get("in_dim") == base + Dq) if sel_no else False
-    used_pass_any = bool(used_pass_gate or used_pass_rag or used_pass_no)
+    Df_gate = int(Xf_gate.size(1))
+    Df_sel_rag = int(Xf_sel_rag.size(1))
+    Df_sel_no = int(Xf_sel_no.size(1)) if Xf_sel_no is not None else 0
+    Df_shared = int(Xf_shared.size(1)) if Xf_shared is not None else 0
 
     return {
         "dataset": dataset,
@@ -886,20 +968,41 @@ def run_eval_dataset(
         "gate_threshold": thr_used,
         "gate_objective": (shared_gate.get("gate_objective") if used_shared else gate.get("gate_objective", "cls")),
         "oracle_pool": pool,
-        "feature_keys_used": feature_keys,
-        "feature_standardization": ("on" if standardize_features_flag else "off"),
-        "feature_stats_used": feat_stats_used,
+        "feature_keys_used": {
+            "gate": feature_keys_used.get("gate", []),
+            "selector_rag": feature_keys_used.get("selector_rag", []),
+            "selector_no_rag": feature_keys_used.get("selector_no_rag", []),
+            "shared_gate": feature_keys_used.get("shared_gate", []),
+        },
+        "feature_stats_used": feature_stats_used,
         "pools_used": {"rag": rag_pool_ds, "no": no_pool_ds},
         "used_shared_gate": used_shared,
         "passage_embeddings_enabled": bool(use_passage_embeddings),
-        "passage_embeddings_used_by_ckpt": used_pass_any,
-        "dims": {"Dq": Dq, "Df": Df, "base": base, "base_plus_pass": base + Dq},
+        "dims": {
+            "Dq": Dq,
+            "Df_gate": Df_gate,
+            "Df_selector_rag": Df_sel_rag,
+            "Df_selector_no": Df_sel_no,
+            "Df_shared_gate": Df_shared,
+        },
         "ckpt_dims": {
             "gate_in_dim": int(gate.get("in_dim") or 0),
             "sel_rag_in_dim": int(sel_rag.get("in_dim") or 0) if sel_rag else 0,
             "sel_no_in_dim": int(sel_no.get("in_dim") or 0) if sel_no else 0,
             "shared_gate_in_dim": int(shared_gate.get("in_dim") or 0) if used_shared else 0,
-        }
+        },
+        "selector_fallback_enabled": bool(selector_fallback),
+        "selector_conf_threshold": float(selector_conf_threshold),
+        "selector_fallback_counts": dict(fallback_counts),
+        "selector_constant_counts": dict(constant_selector_counts),
+        "selector_rag_fallback_expert": sel_rag.get("fallback_expert"),
+        "selector_no_fallback_expert": (sel_no.get("fallback_expert") if sel_no is not None else None),
+        "selector_rag_use_constant": bool(sel_rag.get("use_constant_selector", False)),
+        "selector_no_use_constant": bool(sel_no.get("use_constant_selector", False)) if sel_no is not None else False,
+        "selector_rag_constant_expert": sel_rag.get("constant_selector_expert"),
+        "selector_no_constant_expert": (sel_no.get("constant_selector_expert") if sel_no is not None else None),
+        "selector_rag_fallback_source": sel_rag.get("fallback_source"),
+        "selector_no_fallback_source": (sel_no.get("fallback_source") if sel_no is not None else None),
     }
 
 
@@ -921,15 +1024,23 @@ def print_res(tag: str, res: Dict[str, Any], oracle_policy_aligned: bool, tradeo
         print(f"used_shared_gate=True ({SHARED_GATE_NAME})")
 
     if res.get("passage_embeddings_enabled"):
-        print(f"passage_embeddings_enabled=True | used_by_ckpt={res.get('passage_embeddings_used_by_ckpt')}")
+        print(f"passage_embeddings_enabled=True")
         print(f"dims={res.get('dims')} ckpt_dims={res.get('ckpt_dims')}")
 
     print(f"oracle_pool={res['oracle_pool']}")
     print(f"pools_used={res['pools_used']}")
-    if res.get("feature_keys_used"):
-        print(f"features_used: k={len(res['feature_keys_used'])}")
-        if res.get("feature_stats_used"):
-            print(f"feature_stats_used={res['feature_stats_used']}")
+
+    fku = res.get("feature_keys_used") or {}
+    fsu = res.get("feature_stats_used") or {}
+    if any(len(v or []) > 0 for v in fku.values()):
+        print(
+            f"features_used: gate_k={len(fku.get('gate') or [])} "
+            f"sel_rag_k={len(fku.get('selector_rag') or [])} "
+            f"sel_no_k={len(fku.get('selector_no_rag') or [])} "
+            f"shared_gate_k={len(fku.get('shared_gate') or [])}"
+        )
+        if any(v is not None for v in fsu.values()):
+            print(f"feature_stats_used={fsu}")
 
     print(f"Gate picks: {res['gate_counts']}")
     if res.get("gate_oracle_agreement") is not None:
@@ -939,6 +1050,21 @@ def print_res(tag: str, res: Dict[str, Any], oracle_policy_aligned: bool, tradeo
     if res.get("selector_diag") is not None:
         sd = res["selector_diag"]
         print(f"Selector diagnostics: mean_entropy={sd['mean_entropy']:.4f} | mean_maxprob={sd['mean_maxprob']:.4f} | steps={sd['steps']}")
+    if res.get("selector_fallback_enabled"):
+        print(
+            f"Selector fallback: enabled=True | threshold={res.get('selector_conf_threshold')} | "
+            f"rag_fb={res.get('selector_rag_fallback_expert')} ({res.get('selector_rag_fallback_source')}) | "
+            f"no_fb={res.get('selector_no_fallback_expert')} ({res.get('selector_no_fallback_source')}) | "
+            f"counts={res.get('selector_fallback_counts')}"
+        )
+    if res.get("selector_rag_use_constant") or res.get("selector_no_use_constant"):
+        print(
+            f"Selector constant mode: rag_use_constant={res.get('selector_rag_use_constant')} "
+            f"rag_const={res.get('selector_rag_constant_expert')} | "
+            f"no_use_constant={res.get('selector_no_use_constant')} "
+            f"no_const={res.get('selector_no_constant_expert')} | "
+            f"counts={res.get('selector_constant_counts')}"
+        )
     print(f"Two-stage chosen avg F1={res['chosen_f1']:.4f} | avg EM={res['chosen_em']:.4f} | avg U={res['chosen_u']:.4f}")
     print(f"Oracle     avg F1={res['oracle_f1']:.4f} | avg EM={res['oracle_em']:.4f} | avg U={res['oracle_u']:.4f}\n")
 
@@ -967,21 +1093,47 @@ def main():
 
     ap.add_argument("--eval_all_combined", action="store_true")
 
-    # replace the existing --use_shared_gate argument with:
-    ap.add_argument("--use_shared_gate", action="store_true", default=True,
-                    help="Use shared gate for pubmedqa_v2 vs commonsenseqa (default: enabled)")
-    ap.add_argument("--disable_shared_gate", action="store_false", dest="use_shared_gate",
-                    help="Disable shared gate and use per-dataset gates/policies")
-    # Problem (2): pubmed policy override (matches train)
-    ap.add_argument("--pubmed_policy", type=str, default="none", choices=["forced", "none"],
-                    help="forced: pubmedqa_v2 policy=True (always RAG). none: allow routing (policy=None).")
+    ap.add_argument(
+        "--use_shared_gate",
+        action="store_true",
+        default=True,
+        help="Use shared gate for pubmedqa_v2 vs commonsenseqa (default: enabled)",
+    )
+    ap.add_argument(
+        "--disable_shared_gate",
+        action="store_false",
+        dest="use_shared_gate",
+        help="Disable shared gate and use per-dataset gates/policies",
+    )
 
-    # Problem (3): passage embeddings
-    ap.add_argument("--use_passage_embeddings", action="store_true",
-                    help="Allow passage embeddings. Required if any checkpoint expects them (in_dim includes passages).")
+    ap.add_argument(
+        "--pubmed_policy",
+        type=str,
+        default="none",
+        choices=["forced", "none"],
+        help="forced: pubmedqa_v2 policy=True (always RAG). none: allow routing (policy=None).",
+    )
+
+    ap.add_argument(
+        "--use_passage_embeddings",
+        action="store_true",
+        help="Allow passage embeddings. Required if any checkpoint expects them (in_dim includes passages).",
+    )
     ap.add_argument("--passage_source_expert", type=str, default="base_rag")
     ap.add_argument("--passage_max_docs", type=int, default=5)
     ap.add_argument("--passage_max_chars", type=int, default=1200)
+
+    ap.add_argument(
+        "--selector_fallback",
+        action="store_true",
+        help="If selector confidence is low, fall back to a constant expert saved in the selector checkpoint.",
+    )
+    ap.add_argument(
+        "--selector_conf_threshold",
+        type=float,
+        default=0.45,
+        help="Fallback threshold on selector max probability.",
+    )
 
     args = ap.parse_args()
 
@@ -1009,9 +1161,11 @@ def main():
     if args.feature_keys:
         feature_keys_cli = [x.strip() for x in args.feature_keys.split(",") if x.strip()]
 
-    # load shared gate once
+    datasets_to_eval = [d for d in DATASETS if (args.only is None or d == args.only)]
+    need_shared_gate = bool(args.use_shared_gate and any(should_use_shared_gate_for_dataset(d) for d in datasets_to_eval))
+
     shared_gate = None
-    if args.use_shared_gate:
+    if need_shared_gate:
         shared_dir = model_root / SHARED_GATE_NAME
         shared_gate = load_gate(shared_dir, args.device, args.hidden_dim, args.dropout)
         if shared_gate.get("gate_objective") != "cls":
@@ -1045,6 +1199,8 @@ def main():
                     passage_source_expert=str(args.passage_source_expert),
                     passage_max_docs=int(args.passage_max_docs),
                     passage_max_chars=int(args.passage_max_chars),
+                    selector_fallback=bool(args.selector_fallback),
+                    selector_conf_threshold=float(args.selector_conf_threshold),
                 )
                 print(f"thr={t:<6.3f} | chosen_F1={res['chosen_f1']:.4f} oracle_F1={res['oracle_f1']:.4f} | gate={res['gate_counts']}")
             return
@@ -1073,6 +1229,8 @@ def main():
             passage_source_expert=str(args.passage_source_expert),
             passage_max_docs=int(args.passage_max_docs),
             passage_max_chars=int(args.passage_max_chars),
+            selector_fallback=bool(args.selector_fallback),
+            selector_conf_threshold=float(args.selector_conf_threshold),
         )
 
         tag = ""
@@ -1125,6 +1283,8 @@ def main():
             passage_source_expert=str(args.passage_source_expert),
             passage_max_docs=int(args.passage_max_docs),
             passage_max_chars=int(args.passage_max_chars),
+            selector_fallback=bool(args.selector_fallback),
+            selector_conf_threshold=float(args.selector_conf_threshold),
         )
         per_ds_results[dataset] = res
 
@@ -1132,10 +1292,10 @@ def main():
         combined_N += n
         combined_chosen_f1 += float(res["chosen_f1"]) * n
         combined_chosen_em += float(res["chosen_em"]) * n
-        combined_chosen_u  += float(res["chosen_u"])  * n
+        combined_chosen_u += float(res["chosen_u"]) * n
         combined_oracle_f1 += float(res["oracle_f1"]) * n
         combined_oracle_em += float(res["oracle_em"]) * n
-        combined_oracle_u  += float(res["oracle_u"])  * n
+        combined_oracle_u += float(res["oracle_u"]) * n
 
     print("\n==================== COMBINED (all datasets) ====================\n")
     if combined_N > 0:

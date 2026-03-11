@@ -11,3 +11,6 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+
+prediction/features_uncertainty.jsonl
+prediction/features_retrieval_preview.jsonl
