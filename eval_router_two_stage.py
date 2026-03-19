@@ -127,10 +127,10 @@ def should_use_shared_gate_for_dataset(ds: str) -> bool:
 
 
 def policy_for_dataset(dataset: str, *, pubmed_policy: str) -> Optional[bool]:
-    if dataset in ("hotpotqa", "squad_v2"):
-        return True
-    if dataset == "pubmedqa_v2":
-        return True if pubmed_policy == "forced" else None
+    #if dataset in ("hotpotqa", "squad_v2"):
+     #   return True
+    #if dataset == "pubmedqa_v2":
+     #   return True if pubmed_policy == "forced" else None
     return None
 
 
@@ -235,6 +235,7 @@ def standardize_features_fit(Xf: torch.Tensor, eps: float = 1e-8) -> Tuple[torch
     std = Xf.std(dim=0, keepdim=True).clamp_min(eps)
     return (Xf - mean) / std, {"mean": mean.squeeze(0).tolist(), "std": std.squeeze(0).tolist()}
 
+
 def report_feature_coverage(tag: str, Xf: torch.Tensor) -> None:
     if Xf.numel() == 0 or Xf.size(1) == 0:
         print(f"[FEAT-CHECK][{tag}] no feature columns")
@@ -242,7 +243,8 @@ def report_feature_coverage(tag: str, Xf: torch.Tensor) -> None:
     matched_rows = int((Xf.abs().sum(dim=1) > 0).sum().item())
     mean_active = float((Xf != 0).sum(dim=1).float().mean().item())
     print(f"[FEAT-CHECK][{tag}] matched_rows={matched_rows}/{Xf.size(0)} mean_active_feats={mean_active:.2f}")
-    
+
+
 # --------------------------
 # Passage parsing + embeddings
 # --------------------------
@@ -574,6 +576,7 @@ def run_eval_dataset(
         passage_max_chars: int,
         selector_fallback: bool,
         selector_conf_threshold: float,
+        disable_constant_selector: bool,
 ) -> Dict[str, Any]:
 
     model_dir = model_root / dataset
@@ -592,6 +595,9 @@ def run_eval_dataset(
 
     if sel_rag is None:
         raise SystemExit(f"[{dataset}] missing selector_rag.pt in {model_dir}")
+
+    rag_constant_enabled = bool(sel_rag.get("use_constant_selector", False)) and (not disable_constant_selector)
+    no_constant_enabled = bool(sel_no.get("use_constant_selector", False)) and (not disable_constant_selector) if sel_no is not None else False
 
     embed_model = (
             gate.get("embed_model")
@@ -747,6 +753,11 @@ def run_eval_dataset(
             require_passages_ok=bool(use_passage_embeddings),
         )
 
+    def default_gate_threshold(gate_obj: Dict[str, Any]) -> float:
+        if gate_threshold is not None:
+            return float(gate_threshold)
+        return float(gate_obj.get("calibrated_threshold", 0.5) or 0.5)
+
     def gate_predict_family(i: int) -> str:
         if used_shared:
             sg = shared_gate
@@ -823,7 +834,7 @@ def run_eval_dataset(
         else:
             if fam == "rag":
                 const_expert = sel_rag.get("constant_selector_expert")
-                if sel_rag.get("use_constant_selector") and isinstance(const_expert, str) and const_expert in ex:
+                if rag_constant_enabled and isinstance(const_expert, str) and const_expert in ex:
                     chosen_expert = const_expert
                     constant_selector_counts[f"rag->{const_expert}"] += 1
                 else:
@@ -832,9 +843,18 @@ def run_eval_dataset(
                     xi = X_sel_rag[i]
                     with torch.no_grad():
                         logits = sm(xi.unsqueeze(0))[0]
-                        probs = torch.softmax(logits, dim=0)
-                        cls = int(torch.argmax(probs).item())
-                        chosen_expert = experts[cls]
+                        selector_objective = str(sel_rag["raw_ckpt"].get("selector_objective", ""))
+                        
+                        if selector_objective == "delta_anchor":
+                            scores = logits
+                            cls = int(torch.argmax(scores).item())
+                            chosen_expert = experts[cls]
+                        
+                            probs = torch.softmax(logits, dim=0)  # diagnostics only
+                        else:
+                            probs = torch.softmax(logits, dim=0)
+                            cls = int(torch.argmax(probs).item())
+                            chosen_expert = experts[cls]
 
                         p = probs.detach().cpu().numpy()
                         maxp = float(p.max())
@@ -853,7 +873,7 @@ def run_eval_dataset(
                     chosen_expert = best_in_family(ex, "no")
                 else:
                     const_expert = sel_no.get("constant_selector_expert")
-                    if sel_no.get("use_constant_selector") and isinstance(const_expert, str) and const_expert in ex:
+                    if no_constant_enabled and isinstance(const_expert, str) and const_expert in ex:
                         chosen_expert = const_expert
                         constant_selector_counts[f"no->{const_expert}"] += 1
                     else:
@@ -862,9 +882,18 @@ def run_eval_dataset(
                         xi = X_sel_no[i]
                         with torch.no_grad():
                             logits = sm(xi.unsqueeze(0))[0]
-                            probs = torch.softmax(logits, dim=0)
-                            cls = int(torch.argmax(probs).item())
-                            chosen_expert = experts[cls]
+                            selector_objective = str(sel_rag["raw_ckpt"].get("selector_objective", ""))
+                            
+                            if selector_objective == "delta_anchor":
+                                scores = logits
+                                cls = int(torch.argmax(scores).item())
+                                chosen_expert = experts[cls]
+                            
+                                probs = torch.softmax(logits, dim=0)  # diagnostics only
+                            else:
+                                probs = torch.softmax(logits, dim=0)
+                                cls = int(torch.argmax(probs).item())
+                                chosen_expert = experts[cls]
 
                             p = probs.detach().cpu().numpy()
                             maxp = float(p.max())
@@ -997,8 +1026,9 @@ def run_eval_dataset(
         "selector_constant_counts": dict(constant_selector_counts),
         "selector_rag_fallback_expert": sel_rag.get("fallback_expert"),
         "selector_no_fallback_expert": (sel_no.get("fallback_expert") if sel_no is not None else None),
-        "selector_rag_use_constant": bool(sel_rag.get("use_constant_selector", False)),
-        "selector_no_use_constant": bool(sel_no.get("use_constant_selector", False)) if sel_no is not None else False,
+        "selector_rag_use_constant": bool(rag_constant_enabled),
+        "selector_no_use_constant": bool(no_constant_enabled),
+        "disable_constant_selector": bool(disable_constant_selector),
         "selector_rag_constant_expert": sel_rag.get("constant_selector_expert"),
         "selector_no_constant_expert": (sel_no.get("constant_selector_expert") if sel_no is not None else None),
         "selector_rag_fallback_source": sel_rag.get("fallback_source"),
@@ -1043,6 +1073,8 @@ def print_res(tag: str, res: Dict[str, Any], oracle_policy_aligned: bool, tradeo
             print(f"feature_stats_used={fsu}")
 
     print(f"Gate picks: {res['gate_counts']}")
+    if res.get("disable_constant_selector"):
+        print("Constant selector override: DISABLED (learned selector forced)")
     if res.get("gate_oracle_agreement") is not None:
         ga = res["gate_oracle_agreement"]
         print(f"Gate oracle agreement: acc={ga['acc']:.4f} conf={ga['conf']}")
@@ -1134,6 +1166,11 @@ def main():
         default=0.45,
         help="Fallback threshold on selector max probability.",
     )
+    ap.add_argument(
+        "--disable_constant_selector",
+        action="store_true",
+        help="Ignore checkpoint constant-selector deployment and force evaluation of the learned selector.",
+    )
 
     args = ap.parse_args()
 
@@ -1201,6 +1238,7 @@ def main():
                     passage_max_chars=int(args.passage_max_chars),
                     selector_fallback=bool(args.selector_fallback),
                     selector_conf_threshold=float(args.selector_conf_threshold),
+                    disable_constant_selector=bool(args.disable_constant_selector),
                 )
                 print(f"thr={t:<6.3f} | chosen_F1={res['chosen_f1']:.4f} oracle_F1={res['oracle_f1']:.4f} | gate={res['gate_counts']}")
             return
@@ -1231,6 +1269,7 @@ def main():
             passage_max_chars=int(args.passage_max_chars),
             selector_fallback=bool(args.selector_fallback),
             selector_conf_threshold=float(args.selector_conf_threshold),
+            disable_constant_selector=bool(args.disable_constant_selector),
         )
 
         tag = ""
@@ -1285,6 +1324,7 @@ def main():
             passage_max_chars=int(args.passage_max_chars),
             selector_fallback=bool(args.selector_fallback),
             selector_conf_threshold=float(args.selector_conf_threshold),
+            disable_constant_selector=bool(args.disable_constant_selector),
         )
         per_ds_results[dataset] = res
 

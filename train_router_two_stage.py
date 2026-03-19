@@ -1,32 +1,4 @@
-﻿
-# train_router_two_stage.py
-# Implements:
-#  - Gate Δ-to-gold/Δ-utility training (regression or classification)
-#  - Threshold calibration on validation split (sweep) and saving best threshold
-#  - Feature augmentation via precomputed JSONL feature files (retrieval preview + NO_RAG uncertainty probes)
-#  - Selector margin-weighted training (top1-top2 margin inside family)
-#  - Optional selector margin filtering still supported (existing args)
-#
-# Changes applied:
-#  1) REMOVE SQuAD answerability head training
-#  2) PubMed policy controllable
-#  3) Feature augmentation supported
-#  4) commonsenseqa pools are dynamic
-#  5) --only combined_pubmed_csqa_gate trains one shared classifier gate
-#  6) Optional passage embeddings
-#  7) tradeoff_mode uses exact eval utility
-#  8) Selector can train with either soft CE or expected utility
-#  9) Expected-utility loss uses per-example normalized utilities for stability
-# 10) Constant fallback expert is computed from FULL selector domain
-# 11) Expected-utility checkpoint selection uses HARD argmax utility on validation
-# 12) Each selector checkpoint saves whether learned selector should be bypassed
-# 13) Deployment decision is made using FULL-domain hard utility:
-#       learned selector vs best constant expert, with a small safety margin
-# 14) NEW: gate loss can be weighted by |delta|
-# 15) NEW: selector-only comparative features are supported via "selcmp__" prefix
-#       - gate sees generic features only
-#       - selector sees generic + selector-comparative features
-# 16) NEW: trivial one-expert selectors are saved as constant selectors without training
+﻿# train_router_two_stage.py
 
 import argparse
 import json
@@ -51,9 +23,7 @@ CANON_NO_EXPERTS = ["base_only", "sft_only"]
 
 DATASETS = ["hotpotqa", "squad_v2", "pubmedqa_v2", "commonsenseqa"]
 SPECIAL_ONLY = "combined_pubmed_csqa_gate"
-
 SELECTOR_CMP_PREFIX = "selcmp__"
-
 _DOC_RE = re.compile(r"<DOCUMENT>(.*?)</DOCUMENT>", re.DOTALL)
 
 
@@ -68,7 +38,7 @@ def load_cfg() -> Dict[str, Any]:
 
 
 # --------------------------
-# Utility / tradeoff (MUST match eval_router_two_stage.py)
+# Utility / tradeoff
 # --------------------------
 
 def tradeoff_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,10 +66,8 @@ def get_vram_gb(outcome: Dict[str, Any]) -> float:
 def _get_latency_cap_seconds(tcfg: Dict[str, Any], dataset: str, expert: Optional[str]) -> float:
     caps = tcfg.get("latency_caps") or {}
     default_cap = float(caps.get("default", 3.0))
-
     by_dataset = (caps.get("by_dataset") or {})
     ds_cfg = by_dataset.get(dataset) or {}
-
     cap = float(ds_cfg.get("default", default_cap))
     if expert and expert in ds_cfg:
         cap = float(ds_cfg[expert])
@@ -119,7 +87,6 @@ def tradeoff_U(outcome: Dict[str, Any], tcfg: Dict[str, Any], dataset: str, expe
     cap = _get_latency_cap_seconds(tcfg, dataset, expert)
     lat_ratio = L / max(1e-8, cap)
     lat_pen = tcfg["lambda_latency"] * (lat_ratio if lat_ratio <= 1.0 else (lat_ratio ** 2))
-
     vram_pen = tcfg["mu_vram"] * V
     return float(Q - lat_pen - vram_pen)
 
@@ -133,9 +100,6 @@ def latency_cap_seconds(cfg: Dict[str, Any], dataset: str, expert: str) -> float
 
 
 def utility_value(cfg: Dict[str, Any], dataset: str, expert: str, outcome: Dict[str, Any]) -> float:
-    """
-    Legacy utility (also based on cfg["utility"]). Used when NOT in --tradeoff_mode.
-    """
     u = cfg.get("utility", {}) or {}
     a = float(u.get("alpha_f1", 1.0))
     b = float(u.get("beta_em", 0.0))
@@ -187,7 +151,7 @@ def read_router_train(dataset: str) -> List[Dict[str, Any]]:
 
 
 # --------------------------
-# Pools
+# Pools / policy
 # --------------------------
 
 def pools_for_dataset(dataset: str) -> Tuple[List[str], List[str]]:
@@ -220,7 +184,7 @@ def _best_in_pool(
             best_u = u
             best_e = e
     if best_e is None:
-        return ("", -1e18)
+        return "", -1e18
     return best_e, float(best_u)
 
 
@@ -244,15 +208,11 @@ def _top2_margin_in_pool(
     return float(utils[0] - utils[1])
 
 
-# --------------------------
-# Policy
-# --------------------------
-
 def policy_for_dataset(dataset: str, *, pubmed_policy_mode: str = "none") -> Optional[bool]:
-    if dataset in ("hotpotqa", "squad_v2"):
-        return True
-    if dataset == "pubmedqa_v2":
-        return True if pubmed_policy_mode == "forced" else None
+    #if dataset in ("hotpotqa", "squad_v2"):
+     #   return True
+    #if dataset == "pubmedqa_v2":
+     #   return True if pubmed_policy_mode == "forced" else None
     return None
 
 
@@ -303,10 +263,7 @@ def load_feature_map(paths: List[Path]) -> Dict[str, Dict[str, float]]:
             rid_raw = str(rid_raw)
 
             ds = r.get("dataset")
-            if ds is not None:
-                rid_key = f"{str(ds)}::{rid_raw}"
-            else:
-                rid_key = rid_raw
+            rid_key = f"{str(ds)}::{rid_raw}" if ds is not None else rid_raw
 
             feats = r.get("features")
             if feats is None:
@@ -332,10 +289,6 @@ def infer_feature_keys_from_map(fmap: Dict[str, Dict[str, float]]) -> List[str]:
 
 
 def split_feature_keys_for_models(feature_keys: List[str]) -> Tuple[List[str], List[str]]:
-    """
-    gate_keys: generic features only
-    selector_keys: generic + selector-comparative features
-    """
     gate_keys = [k for k in feature_keys if not str(k).startswith(SELECTOR_CMP_PREFIX)]
     selector_keys = list(feature_keys)
     return gate_keys, selector_keys
@@ -357,6 +310,7 @@ def build_feature_matrix(rows: List[Dict[str, Any]], fmap: Dict[str, Dict[str, f
                 Xf[i, j] = float(feats[k])
     return Xf
 
+
 def report_feature_coverage(tag: str, Xf: torch.Tensor) -> None:
     if Xf.numel() == 0 or Xf.size(1) == 0:
         print(f"[FEAT-CHECK][{tag}] no feature columns")
@@ -364,6 +318,7 @@ def report_feature_coverage(tag: str, Xf: torch.Tensor) -> None:
     matched_rows = int((Xf.abs().sum(dim=1) > 0).sum().item())
     mean_active = float((Xf != 0).sum(dim=1).float().mean().item())
     print(f"[FEAT-CHECK][{tag}] matched_rows={matched_rows}/{Xf.size(0)} mean_active_feats={mean_active:.2f}")
+
 
 def standardize_features(Xf: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, Dict[str, Any]]:
     if Xf.numel() == 0 or Xf.size(1) == 0:
@@ -397,9 +352,6 @@ def build_passage_embedding_matrix(
         max_chars: int = 1200,
         batch_size_docs: int = 64,
 ) -> torch.Tensor:
-    """
-    Returns [N, D] (CPU tensor). D = embedding dim. Mean over docs from <DOCUMENT> blocks.
-    """
     dummy = embedder.encode(["dummy"], batch_size=1).float()
     d = int(dummy.shape[-1])
 
@@ -554,12 +506,6 @@ def build_gate_example_weights(
         weight_min: float = 0.25,
         weight_max: float = 4.0,
 ) -> torch.Tensor:
-    """
-    Build per-example weights from |delta|.
-
-    Large |delta| => high-stakes routing decision => larger training weight.
-    Normalized by median |delta| for stability across datasets.
-    """
     if deltas.numel() == 0:
         return torch.zeros((0,), dtype=torch.float32)
 
@@ -592,15 +538,13 @@ def selector_hard_utility_score(
         for xb, ub in loader:
             xb = xb.to(device)
             ub = ub.to(device).float()
-
             logits = model(xb)
             hard_idx = torch.argmax(logits, dim=1)
             hard_u = ub.gather(1, hard_idx.unsqueeze(1)).squeeze(1)
-
             total_u += float(hard_u.sum().item())
             total_n += int(xb.size(0))
-
     return total_u / max(1, total_n)
+
 
 def _quantiles_np(a: np.ndarray, qs: List[float]) -> List[float]:
     if a.size == 0:
@@ -686,7 +630,6 @@ def print_selector_domain_diagnostics(
     const_expert = experts[const_idx]
     const_u = float(avg_u[const_idx])
     headroom = float(oracle_u - const_u)
-
     avg_u_pairs = [(experts[i], round(float(avg_u[i]), 4)) for i in range(len(experts))]
 
     print(f"[DIAG][{dataset}][{name}] oracle_counts={dist}")
@@ -736,8 +679,9 @@ def print_selector_domain_diagnostics(
         pretty = [(k, round(v, 4)) for v, k in top]
         print(f"[DIAG][{dataset}][{name}] selcmp_separation_top={pretty}")
 
+
 # --------------------------
-# Gate: Δ training + threshold calibration
+# Gate
 # --------------------------
 
 def build_gate_delta_targets(
@@ -748,9 +692,6 @@ def build_gate_delta_targets(
         use_tradeoff: bool,
         tcfg: Dict[str, Any],
 ) -> torch.Tensor:
-    """
-    delta_i = bestRAG - bestNO
-    """
     rag_pool_ds, no_pool_ds = pools_for_dataset(dataset)
 
     deltas: List[float] = []
@@ -1015,10 +956,10 @@ def train_gate_delta_regressor(
     }
     print(f"[gate-delta] calibrated thr={best_thr:.4f} | val_sign_acc={best_acc:.4f}")
     return model, info
-    
+
 
 # --------------------------
-# Selector training
+# Selector targets
 # --------------------------
 
 def soft_targets_from_utils(utils: np.ndarray, tau: float) -> np.ndarray:
@@ -1047,6 +988,31 @@ def build_selector_soft_targets(
             dtype=np.float32,
         )
         ys.append(soft_targets_from_utils(scores, tau=tau))
+    if not ys:
+        return torch.zeros((0, len(experts_in_group)), dtype=torch.float32)
+    return torch.from_numpy(np.stack(ys, axis=0))
+
+
+def build_selector_delta_anchor_matrix(
+        cfg: Dict[str, Any],
+        dataset: str,
+        rows: List[Dict[str, Any]],
+        idxs: List[int],
+        experts_in_group: List[str],
+        anchor_expert: str,
+        *,
+        use_tradeoff: bool,
+        tcfg: Dict[str, Any],
+) -> torch.Tensor:
+    ys = []
+    for i in idxs:
+        ex = rows[i]["experts"]
+        anchor_u = score_for_targets(cfg, dataset, anchor_expert, ex[anchor_expert], use_tradeoff=use_tradeoff, tcfg=tcfg)
+        deltas = []
+        for e in experts_in_group:
+            u = score_for_targets(cfg, dataset, e, ex[e], use_tradeoff=use_tradeoff, tcfg=tcfg)
+            deltas.append(float(u - anchor_u))
+        ys.append(np.array(deltas, dtype=np.float32))
     if not ys:
         return torch.zeros((0, len(experts_in_group)), dtype=torch.float32)
     return torch.from_numpy(np.stack(ys, axis=0))
@@ -1085,17 +1051,12 @@ def compute_constant_fallback_expert(
         use_tradeoff: bool,
         tcfg: Dict[str, Any],
 ) -> Tuple[str, Dict[str, float]]:
-    """
-    Best constant expert over the FULL selector domain.
-    """
     if len(experts_in_group) == 0:
         return "", {}
     if len(idxs) == 0:
         return experts_in_group[0], {e: 0.0 for e in experts_in_group}
 
-    U_all = build_selector_utility_matrix(
-        cfg, dataset, rows, idxs, experts_in_group, use_tradeoff=use_tradeoff, tcfg=tcfg
-    )
+    U_all = build_selector_utility_matrix(cfg, dataset, rows, idxs, experts_in_group, use_tradeoff=use_tradeoff, tcfg=tcfg)
     avg_u = U_all.mean(dim=0)
     best_idx = int(avg_u.argmax().item())
     best_expert = experts_in_group[best_idx]
@@ -1163,10 +1124,15 @@ def selector_margin_weights(
     return torch.tensor(w, dtype=torch.float32)
 
 
+# --------------------------
+# Selector trainers
+# --------------------------
+
 def train_selector_soft(
         model: nn.Module,
         X: torch.Tensor,
         y_soft: torch.Tensor,
+        U_eval: torch.Tensor,
         *,
         device: str,
         lr: float,
@@ -1183,10 +1149,11 @@ def train_selector_soft(
         prior: Optional[torch.Tensor],
         hard_labels_for_sampler: Optional[torch.Tensor],
         example_weights: Optional[torch.Tensor],
-) -> Tuple[nn.Module, float]:
+) -> Tuple[nn.Module, Dict[str, Any]]:
     tr_idx, va_idx = split_train_val_indices(int(X.size(0)), 0.2, seed, min_val=min_val)
     X_tr, y_tr = X[tr_idx], y_soft[tr_idx]
     X_va, y_va = X[va_idx], y_soft[va_idx]
+    U_va = U_eval[va_idx]
 
     w_tr = None
     w_va = None
@@ -1207,15 +1174,17 @@ def train_selector_soft(
 
     va_loader = DataLoader(TensorDatasetSoft(X_va, y_va, w_va), batch_size=batch_size, shuffle=False)
 
-    best_score = -1e18
+    best_metric = -1e18
     best_state = None
     bad = 0
+    best_val_softce = 1e18
+    best_val_argmax_u = -1e18
 
     for ep in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
 
-        for batch in tqdm(tr_loader, desc="Batches[sel]", leave=False):
+        for batch in tqdm(tr_loader, desc="Batches[sel-softCE]", leave=False):
             if len(batch) == 2:
                 xb, tb = batch
                 wb = None
@@ -1229,7 +1198,6 @@ def train_selector_soft(
 
             opt.zero_grad(set_to_none=True)
             logits = model(xb)
-
             per_ex = soft_cross_entropy_per_example(logits, tb)
             loss = weighted_mean(per_ex, wb)
 
@@ -1261,6 +1229,7 @@ def train_selector_soft(
                     wb = None
                 else:
                     xb, tb, wb = batch
+
                 xb = xb.to(device)
                 tb = tb.to(device)
                 if wb is not None:
@@ -1268,6 +1237,7 @@ def train_selector_soft(
 
                 logits = model(xb)
                 per_ex = soft_cross_entropy_per_example(logits, tb)
+
                 if wb is None:
                     total_vloss += float(per_ex.sum().item())
                     denom += float(per_ex.numel())
@@ -1275,25 +1245,204 @@ def train_selector_soft(
                     total_vloss += float((per_ex * wb).sum().item())
                     denom += float(wb.sum().item())
 
-        val_loss = total_vloss / max(1e-8, denom)
-        val_score = -val_loss
+        val_softce = total_vloss / max(1e-8, denom)
+        val_argmax_u = selector_hard_utility_score(model, X_va, U_va, device=device, batch_size=batch_size)
 
-        print(f"[sel] epoch {ep:02d} | train_loss={train_loss:.4f} | val_softCE={val_loss:.4f}")
+        print(
+            f"[sel-softCE] epoch {ep:02d} | train_loss={train_loss:.4f} "
+            f"| val_softCE={val_softce:.4f} | val_argmax_u={val_argmax_u:.4f}"
+        )
 
-        if val_score > best_score + min_delta:
-            best_score = val_score
+        if val_argmax_u > best_metric + min_delta:
+            best_metric = val_argmax_u
+            best_val_softce = val_softce
+            best_val_argmax_u = val_argmax_u
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             bad = 0
         else:
             bad += 1
             if bad >= patience:
-                print(f"[sel] early stop. best_val_score={best_score:.4f}")
+                print(f"[sel-softCE] early stop. best_val_argmax_u={best_metric:.4f}")
                 break
 
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
-    return model, float(best_score)
+
+    if U_va.numel() == 0:
+        best_const_idx = 0
+        best_const_val_u = -1e18
+    else:
+        const_scores = [float(U_va[:, j].mean().item()) for j in range(U_va.size(1))]
+        best_const_idx = int(np.argmax(const_scores))
+        best_const_val_u = float(const_scores[best_const_idx])
+
+    info = {
+        "best_val_softce": float(best_val_softce),
+        "best_val_argmax_u": float(best_val_argmax_u),
+        "best_constant_val_u": float(best_const_val_u),
+        "best_constant_expert_idx": int(best_const_idx),
+        "val_size": int(len(va_idx)),
+    }
+    return model, info
+
+
+def train_selector_hard_ce(
+        model: nn.Module,
+        X: torch.Tensor,
+        y_hard: torch.Tensor,
+        U_targets: torch.Tensor,
+        *,
+        device: str,
+        lr: float,
+        weight_decay: float,
+        batch_size: int,
+        epochs: int,
+        patience: int,
+        min_delta: float,
+        seed: int,
+        min_val: int,
+        balanced_sampler: bool,
+        example_weights: Optional[torch.Tensor],
+) -> Tuple[nn.Module, Dict[str, Any]]:
+    tr_idx, va_idx = split_train_val_indices(int(X.size(0)), 0.2, seed, min_val=min_val)
+    X_tr, y_tr = X[tr_idx], y_hard[tr_idx]
+    X_va, y_va = X[va_idx], y_hard[va_idx]
+    U_va = U_targets[va_idx]
+
+    w_tr = None
+    w_va = None
+    if example_weights is not None and example_weights.numel() == X.size(0):
+        w_tr = example_weights[tr_idx]
+        w_va = example_weights[va_idx]
+
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    class_w = class_weights_from_labels(y_tr, int(U_targets.size(1)), device)
+
+    if balanced_sampler:
+        sampler = make_balanced_sampler_from_hard_labels(y_tr)
+        tr_loader = DataLoader(TensorDatasetXY(X_tr, y_tr, w_tr), batch_size=batch_size, sampler=sampler)
+    else:
+        tr_loader = DataLoader(TensorDatasetXY(X_tr, y_tr, w_tr), batch_size=batch_size, shuffle=True)
+
+    va_loader = DataLoader(TensorDatasetXY(X_va, y_va, w_va), batch_size=batch_size, shuffle=False)
+
+    best_metric = -1e18
+    best_state = None
+    bad = 0
+    best_val_acc = -1.0
+    best_val_argmax_u = -1e18
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        for batch in tqdm(tr_loader, desc="Batches[sel-CE]", leave=False):
+            if len(batch) == 2:
+                xb, yb = batch
+                wb = None
+            else:
+                xb, yb, wb = batch
+
+            xb = xb.to(device)
+            yb = yb.to(device).long()
+            if wb is not None:
+                wb = wb.to(device).float()
+
+            opt.zero_grad(set_to_none=True)
+            logits = model(xb)
+            per_ex = F.cross_entropy(logits, yb, weight=class_w, reduction="none")
+            loss = weighted_mean(per_ex, wb)
+            loss.backward()
+            opt.step()
+            total_loss += float(loss.item()) * xb.size(0)
+
+        train_loss = total_loss / max(1, len(tr_loader.dataset))
+
+        model.eval()
+        total_correct = 0.0
+        total_acc_w = 0.0
+        total_hard_u = 0.0
+        total_u_w = 0.0
+
+        with torch.no_grad():
+            ptr = 0
+            for batch in va_loader:
+                if len(batch) == 2:
+                    xb, yb = batch
+                    wb = None
+                else:
+                    xb, yb, wb = batch
+
+                bs = xb.size(0)
+                ub = U_va[ptr:ptr + bs]
+                ptr += bs
+
+                xb = xb.to(device)
+                yb = yb.to(device).long()
+                ub = ub.to(device).float()
+
+                logits = model(xb)
+                pred = torch.argmax(logits, dim=1)
+                hard_u = ub.gather(1, pred.unsqueeze(1)).squeeze(1)
+
+                if wb is None:
+                    total_correct += float((pred == yb).sum().item())
+                    total_acc_w += float(bs)
+                    total_hard_u += float(hard_u.sum().item())
+                    total_u_w += float(bs)
+                else:
+                    wb = wb.to(device).float()
+                    total_correct += float((((pred == yb).float()) * wb).sum().item())
+                    total_acc_w += float(wb.sum().item())
+                    total_hard_u += float((hard_u * wb).sum().item())
+                    total_u_w += float(wb.sum().item())
+
+        val_acc = total_correct / max(1e-8, total_acc_w)
+        val_argmax_u = total_hard_u / max(1e-8, total_u_w)
+
+        print(
+            f"[sel-CE] epoch {ep:02d} | train_loss={train_loss:.4f} "
+            f"| val_acc={val_acc:.4f} | val_argmax_u={val_argmax_u:.4f}"
+        )
+
+        if val_argmax_u > best_metric + min_delta:
+            best_metric = val_argmax_u
+            best_val_acc = val_acc
+            best_val_argmax_u = val_argmax_u
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                print(f"[sel-CE] early stop. best_val_argmax_u={best_metric:.4f}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+
+    if U_va.numel() == 0:
+        best_const_idx = 0
+        best_const_val_u = -1e18
+    else:
+        if w_va is not None:
+            denom = w_va.sum().clamp_min(1e-8)
+            const_scores = [float(((U_va[:, j] * w_va).sum() / denom).item()) for j in range(U_va.size(1))]
+        else:
+            const_scores = [float(U_va[:, j].mean().item()) for j in range(U_va.size(1))]
+        best_const_idx = int(np.argmax(const_scores))
+        best_const_val_u = float(const_scores[best_const_idx])
+
+    info = {
+        "best_val_acc": float(best_val_acc),
+        "best_val_argmax_u": float(best_val_argmax_u),
+        "best_constant_val_u": float(best_const_val_u),
+        "best_constant_expert_idx": int(best_const_idx),
+        "val_size": int(len(va_idx)),
+    }
+    return model, info
 
 
 def train_selector_expected_utility(
@@ -1473,6 +1622,163 @@ def train_selector_expected_utility(
     return model, info
 
 
+def train_selector_delta_anchor(
+        model: nn.Module,
+        X: torch.Tensor,
+        D_targets: torch.Tensor,
+        U_targets: torch.Tensor,
+        *,
+        device: str,
+        lr: float,
+        weight_decay: float,
+        batch_size: int,
+        epochs: int,
+        patience: int,
+        min_delta: float,
+        seed: int,
+        min_val: int,
+        example_weights: Optional[torch.Tensor],
+) -> Tuple[nn.Module, Dict[str, Any]]:
+    tr_idx, va_idx = split_train_val_indices(int(X.size(0)), 0.2, seed, min_val=min_val)
+    X_tr, D_tr = X[tr_idx], D_targets[tr_idx]
+    X_va, D_va = X[va_idx], D_targets[va_idx]
+    U_va = U_targets[va_idx]
+
+    w_tr = None
+    w_va = None
+    if example_weights is not None and example_weights.numel() == X.size(0):
+        w_tr = example_weights[tr_idx]
+        w_va = example_weights[va_idx]
+
+    model = model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    tr_loader = DataLoader(TensorDatasetSoft(X_tr, D_tr, w_tr), batch_size=batch_size, shuffle=True)
+    va_loader = DataLoader(TensorDatasetSoft(X_va, D_va, w_va), batch_size=batch_size, shuffle=False)
+
+    best_metric = -1e18
+    best_state = None
+    bad = 0
+    best_val_huber = 1e18
+    best_val_argmax_u = -1e18
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        for batch in tqdm(tr_loader, desc="Batches[sel-delta-anchor]", leave=False):
+            if len(batch) == 2:
+                xb, db = batch
+                wb = None
+            else:
+                xb, db, wb = batch
+
+            xb = xb.to(device)
+            db = db.to(device).float()
+            if wb is not None:
+                wb = wb.to(device).float()
+
+            opt.zero_grad(set_to_none=True)
+            pred = model(xb)
+            per_ex = F.huber_loss(pred, db, reduction="none", delta=0.1).mean(dim=1)
+            loss = weighted_mean(per_ex, wb)
+            loss.backward()
+            opt.step()
+            total_loss += float(loss.item()) * xb.size(0)
+
+        train_loss = total_loss / max(1, len(tr_loader.dataset))
+
+        model.eval()
+        total_vloss = 0.0
+        denom = 0.0
+        total_hard_u = 0.0
+        total_u_w = 0.0
+
+        with torch.no_grad():
+            ptr = 0
+            for batch in va_loader:
+                if len(batch) == 2:
+                    xb, db = batch
+                    wb = None
+                else:
+                    xb, db, wb = batch
+
+                bs = xb.size(0)
+                ub = U_va[ptr:ptr + bs]
+                ptr += bs
+
+                xb = xb.to(device)
+                db = db.to(device).float()
+                ub = ub.to(device).float()
+                if wb is not None:
+                    wb = wb.to(device).float()
+
+                pred = model(xb)
+                per_ex = F.huber_loss(pred, db, reduction="none", delta=0.1).mean(dim=1)
+                hard_idx = torch.argmax(pred, dim=1)
+                hard_u = ub.gather(1, hard_idx.unsqueeze(1)).squeeze(1)
+
+                if wb is None:
+                    total_vloss += float(per_ex.sum().item())
+                    denom += float(per_ex.numel())
+                    total_hard_u += float(hard_u.sum().item())
+                    total_u_w += float(bs)
+                else:
+                    total_vloss += float((per_ex * wb).sum().item())
+                    denom += float(wb.sum().item())
+                    total_hard_u += float((hard_u * wb).sum().item())
+                    total_u_w += float(wb.sum().item())
+
+        val_huber = total_vloss / max(1e-8, denom)
+        val_argmax_u = total_hard_u / max(1e-8, total_u_w)
+
+        print(
+            f"[sel-delta-anchor] epoch {ep:02d} | train_loss={train_loss:.4f} "
+            f"| val_huber={val_huber:.4f} | val_argmax_u={val_argmax_u:.4f}"
+        )
+
+        if val_argmax_u > best_metric + min_delta:
+            best_metric = val_argmax_u
+            best_val_huber = val_huber
+            best_val_argmax_u = val_argmax_u
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                print(f"[sel-delta-anchor] early stop. best_val_argmax_u={best_metric:.4f}")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+
+    if U_va.numel() == 0:
+        best_const_idx = 0
+        best_const_val_u = -1e18
+    else:
+        if w_va is not None:
+            denom = w_va.sum().clamp_min(1e-8)
+            const_scores = [float(((U_va[:, j] * w_va).sum() / denom).item()) for j in range(U_va.size(1))]
+        else:
+            const_scores = [float(U_va[:, j].mean().item()) for j in range(U_va.size(1))]
+        best_const_idx = int(np.argmax(const_scores))
+        best_const_val_u = float(const_scores[best_const_idx])
+
+    info = {
+        "best_val_huber": float(best_val_huber),
+        "best_val_argmax_u": float(best_val_argmax_u),
+        "best_constant_val_u": float(best_const_val_u),
+        "best_constant_expert_idx": int(best_const_idx),
+        "val_size": int(len(va_idx)),
+    }
+    return model, info
+
+
+# --------------------------
+# Trivial selector saver
+# --------------------------
+
 def save_trivial_selector_ckpt(
         *,
         path: Path,
@@ -1551,13 +1857,9 @@ def save_trivial_selector_ckpt(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--only",
-        type=str,
-        default=None,
-        help="Train only one dataset (hotpotqa|squad_v2|pubmedqa_v2|commonsenseqa|combined_pubmed_csqa_gate)",
-    )
-    ap.add_argument("--out_dir", type=str, default="results/two_stage_utility", help="Where to save trained models")
+    ap.add_argument("--only", type=str, default=None,
+                    help="Train only one dataset (hotpotqa|squad_v2|pubmedqa_v2|commonsenseqa|combined_pubmed_csqa_gate)")
+    ap.add_argument("--out_dir", type=str, default="results/two_stage_utility")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     ap.add_argument("--seed", type=int, default=1337)
@@ -1574,10 +1876,8 @@ def main():
     ap.add_argument("--gate_delta", type=float, default=0.02)
     ap.add_argument("--gate_huber_delta", type=float, default=0.1)
 
-    ap.add_argument("--gate_use_delta_weighting", action="store_true",
-                    help="Weight gate loss by |delta| so high-stakes routing errors matter more.")
-    ap.add_argument("--gate_weight_power", type=float, default=1.0,
-                    help="Weight ~ (|delta| / median|delta|)^power")
+    ap.add_argument("--gate_use_delta_weighting", action="store_true")
+    ap.add_argument("--gate_weight_power", type=float, default=1.0)
     ap.add_argument("--gate_weight_min", type=float, default=0.25)
     ap.add_argument("--gate_weight_max", type=float, default=4.0)
 
@@ -1605,35 +1905,15 @@ def main():
     ap.add_argument("--standardize_features", action="store_true")
     ap.add_argument("--save_feature_stats", action="store_true")
 
-    ap.add_argument(
-        "--pubmed_policy",
-        type=str,
-        default="none",
-        choices=["forced", "none"],
-        help="forced: pubmedqa_v2 policy=True (always RAG). none: allow routing (policy=None).",
-    )
-
-    ap.add_argument(
-        "--use_passage_embeddings",
-        action="store_true",
-        help="Append mean embedding of retrieved <DOCUMENT> passages from prediction_raw.",
-    )
-    ap.add_argument(
-        "--passage_source_expert",
-        type=str,
-        default="base_rag",
-        help="Which expert's prediction_raw to parse for <DOCUMENT> passages.",
-    )
+    ap.add_argument("--pubmed_policy", type=str, default="none", choices=["forced", "none"])
+    ap.add_argument("--use_passage_embeddings", action="store_true")
+    ap.add_argument("--passage_source_expert", type=str, default="base_rag")
     ap.add_argument("--passage_max_docs", type=int, default=5)
     ap.add_argument("--passage_max_chars", type=int, default=1200)
 
-    ap.add_argument("--selector_objective", type=str, default="expected_u", choices=["soft_ce", "expected_u"])
-    ap.add_argument(
-        "--selector_constant_margin",
-        type=float,
-        default=0.002,
-        help="Use constant selector unless learned selector beats best constant by at least this margin on full-domain hard utility.",
-    )
+    ap.add_argument("--selector_objective", type=str, default="expected_u",
+                    choices=["soft_ce", "expected_u", "hard_ce", "delta_anchor"])
+    ap.add_argument("--selector_constant_margin", type=float, default=0.002)
 
     args = ap.parse_args()
 
@@ -1659,9 +1939,6 @@ def main():
 
     gate_feature_keys, selector_feature_keys = split_feature_keys_for_models(feature_keys)
 
-    # ----------------------------
-    # Shared gate mode
-    # ----------------------------
     if args.only == SPECIAL_ONLY:
         rows_pub = read_router_train("pubmedqa_v2")
         rows_cs = read_router_train("commonsenseqa")
@@ -1669,7 +1946,6 @@ def main():
 
         questions = [r["question"] for r in rows]
         total = len(rows)
-
         y = torch.tensor([1] * len(rows_pub) + [0] * len(rows_cs), dtype=torch.long)
 
         embed_model = "sentence-transformers/all-mpnet-base-v2"
@@ -1696,22 +1972,11 @@ def main():
             X_gate_all = torch.cat([X_gate_all, Xp], dim=1)
 
         gate_in_dim = int(X_gate_all.size(1))
-
         model_dir = out_root / SPECIAL_ONLY
         model_dir.mkdir(parents=True, exist_ok=True)
         gate_path = model_dir / "gate.pt"
 
         print(f"\n=== {SPECIAL_ONLY} === total={total} (pubmed={len(rows_pub)} csqa={len(rows_cs)}) embed={embed_model}")
-        if gate_feature_keys or selector_feature_keys:
-            print(
-                f"[{SPECIAL_ONLY}] features: gate_k={len(gate_feature_keys)} sel_k={len(selector_feature_keys)} "
-                f"| base_dim={in_dim_q} pass={'on' if args.use_passage_embeddings else 'off'} => gate_in_dim={gate_in_dim}"
-            )
-        if args.use_passage_embeddings:
-            print(
-                f"[{SPECIAL_ONLY}] passage embeddings: enabled | src={args.passage_source_expert} "
-                f"max_docs={args.passage_max_docs} max_chars={args.passage_max_chars}"
-            )
 
         gate_model = MLP(gate_in_dim, args.hidden_dim, args.dropout, out_dim=2)
         gate_model, best_acc = train_gate_classifier(
@@ -1752,9 +2017,6 @@ def main():
         print(f"\nDONE. Models saved under: {out_root}")
         return
 
-    # ----------------------------
-    # Per-dataset training
-    # ----------------------------
     for dataset in DATASETS:
         if args.only and dataset != args.only:
             continue
@@ -1777,6 +2039,7 @@ def main():
         Xf_sel = build_feature_matrix(rows, fmap, selector_feature_keys) if selector_feature_keys else torch.zeros((total, 0), dtype=torch.float32)
         report_feature_coverage(f"{dataset}/gate_raw", Xf_gate)
         report_feature_coverage(f"{dataset}/selector_raw", Xf_sel)
+
         gate_feat_stats = None
         sel_feat_stats = None
         if args.standardize_features and Xf_gate.size(1) > 0:
@@ -1814,27 +2077,20 @@ def main():
                 f"| base_dim={in_dim_q} pass={'on' if args.use_passage_embeddings else 'off'} "
                 f"=> gate_in_dim={gate_in_dim} sel_in_dim={sel_in_dim}"
             )
-        if args.use_passage_embeddings:
-            print(
-                f"[{dataset}] passage embeddings: enabled | src={args.passage_source_expert} "
-                f"max_docs={args.passage_max_docs} max_chars={args.passage_max_chars}"
-            )
         if dataset == "pubmedqa_v2":
             print(f"[{dataset}] pubmed_policy={args.pubmed_policy}")
         print(f"[{dataset}] pools | rag={rag_pool_ds} no={no_pool_ds}")
 
         model_dir = out_root / dataset
         model_dir.mkdir(parents=True, exist_ok=True)
-
         gate_path = model_dir / "gate.pt"
 
-        # ---- Gate ----
         if pol is None:
             deltas = build_gate_delta_targets(cfg, dataset, rows, use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg)
-        
+
             if args.print_target_stats:
                 print_gate_target_diagnostics(dataset, deltas, float(args.gate_delta))
-        
+
             gate_example_weights = None
             if args.gate_use_delta_weighting:
                 gate_example_weights = build_gate_example_weights(
@@ -1849,10 +2105,7 @@ def main():
                 if len(idx_gate) < 200:
                     print(f"[{dataset}] gate-cls: too few examples after deadzone (kept={len(idx_gate)}). Lower gate_delta.")
                 X_gate = X_gate_all[idx_gate] if len(idx_gate) > 0 else X_gate_all[:0]
-
-                gate_w_sel = None
-                if gate_example_weights is not None and len(idx_gate) > 0:
-                    gate_w_sel = gate_example_weights[idx_gate]
+                gate_w_sel = gate_example_weights[idx_gate] if (gate_example_weights is not None and len(idx_gate) > 0) else None
 
                 gate_model = MLP(gate_in_dim, args.hidden_dim, args.dropout, out_dim=2)
                 if y_gate.numel() > 0:
@@ -1964,7 +2217,6 @@ def main():
             torch.save(ckpt, gate_path)
             print(f"[{dataset}] gate forced={pol}; wrote marker -> {gate_path}")
 
-        # ---- Selectors ----
         sel_rag_path = model_dir / "selector_rag.pt"
         sel_no_path = model_dir / "selector_no_rag.pt"
 
@@ -1973,9 +2225,7 @@ def main():
 
         if pol is True:
             idx_rag = list(range(total))
-            idx_no = []
         elif pol is False:
-            idx_rag = []
             idx_no = list(range(total))
         else:
             deltas = build_gate_delta_targets(cfg, dataset, rows, use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg)
@@ -1987,26 +2237,14 @@ def main():
                     idx_no.append(i)
 
         idx_rag_f = filter_by_margin_window(
-            cfg,
-            dataset,
-            rows,
-            idx_rag,
-            rag_pool_ds,
-            margin_min=args.sel_margin_min,
-            margin_max=args.sel_margin_max,
-            use_tradeoff=bool(args.tradeoff_mode),
-            tcfg=tcfg,
+            cfg, dataset, rows, idx_rag, rag_pool_ds,
+            margin_min=args.sel_margin_min, margin_max=args.sel_margin_max,
+            use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg,
         )
         idx_no_f = filter_by_margin_window(
-            cfg,
-            dataset,
-            rows,
-            idx_no,
-            no_pool_ds,
-            margin_min=args.sel_margin_min,
-            margin_max=args.sel_margin_max,
-            use_tradeoff=bool(args.tradeoff_mode),
-            tcfg=tcfg,
+            cfg, dataset, rows, idx_no, no_pool_ds,
+            margin_min=args.sel_margin_min, margin_max=args.sel_margin_max,
+            use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg,
         )
 
         print(
@@ -2018,41 +2256,20 @@ def main():
         if args.print_target_stats:
             if len(idx_rag) > 0:
                 U_diag_rag = build_selector_utility_matrix(
-                    cfg,
-                    dataset,
-           
-                    rows,
-                    idx_rag,
-                    rag_pool_ds,
-                    use_tradeoff=bool(args.tradeoff_mode),
-                    tcfg=tcfg,
+                    cfg, dataset, rows, idx_rag, rag_pool_ds,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
                 )
                 print_selector_domain_diagnostics(
-                    dataset,
-                    "selector_rag_full",
-                    U_diag_rag,
-                    rag_pool_ds,
-                    Xf_sel[idx_rag],
-                    selector_feature_keys,
+                    dataset, "selector_rag_full", U_diag_rag, rag_pool_ds, Xf_sel[idx_rag], selector_feature_keys
                 )
-        
+
             if pol is None and len(idx_no) > 0:
                 U_diag_no = build_selector_utility_matrix(
-                    cfg,
-                    dataset,
-                    rows,
-                    idx_no,
-                    no_pool_ds,
-                    use_tradeoff=bool(args.tradeoff_mode),
-                    tcfg=tcfg,
+                    cfg, dataset, rows, idx_no, no_pool_ds,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
                 )
                 print_selector_domain_diagnostics(
-                    dataset,
-                    "selector_no_rag_full",
-                    U_diag_no,
-                    no_pool_ds,
-                    Xf_sel[idx_no],
-                    selector_feature_keys,
+                    dataset, "selector_no_rag_full", U_diag_no, no_pool_ds, Xf_sel[idx_no], selector_feature_keys
                 )
 
         def make_selector_prior(y_hard: torch.Tensor, num_classes: int) -> torch.Tensor:
@@ -2068,13 +2285,8 @@ def main():
         # -----------------
         if len(rag_pool_ds) <= 1:
             const_expert, avg_utility_by_expert = compute_constant_fallback_expert(
-                cfg,
-                dataset,
-                rows,
-                idx_rag,
-                rag_pool_ds,
-                use_tradeoff=bool(args.tradeoff_mode),
-                tcfg=tcfg,
+                cfg, dataset, rows, idx_rag, rag_pool_ds,
+                use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
             )
             print(f"[{dataset}] selector_rag is trivial (only one expert: {rag_pool_ds}); saving constant selector.")
             save_trivial_selector_ckpt(
@@ -2107,23 +2319,12 @@ def main():
                 selector_constant_margin=float(args.selector_constant_margin),
             )
             print(f"[{dataset}] saved trivial selector_rag -> {sel_rag_path}")
-        elif should_train_selector(
-                len(idx_rag_f),
-                min_train=args.min_train_selector,
-                min_val=args.min_val_selector,
-                name="selector_rag",
-                ds=dataset,
-        ):
-            Xg = X_sel_all[idx_rag_f]
 
+        elif should_train_selector(len(idx_rag_f), min_train=args.min_train_selector, min_val=args.min_val_selector, name="selector_rag", ds=dataset):
+            Xg = X_sel_all[idx_rag_f]
             U_targets = build_selector_utility_matrix(
-                cfg,
-                dataset,
-                rows,
-                idx_rag_f,
-                rag_pool_ds,
-                use_tradeoff=bool(args.tradeoff_mode),
-                tcfg=tcfg,
+                cfg, dataset, rows, idx_rag_f, rag_pool_ds,
+                use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
             )
             y_hard = U_targets.argmax(dim=1).long()
 
@@ -2142,13 +2343,8 @@ def main():
             ex_w = None
             if args.sel_use_margin_weighting:
                 ex_w = selector_margin_weights(
-                    cfg,
-                    dataset,
-                    rows,
-                    idx_rag_f,
-                    rag_pool_ds,
-                    use_tradeoff=bool(args.tradeoff_mode),
-                    tcfg=tcfg,
+                    cfg, dataset, rows, idx_rag_f, rag_pool_ds,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg,
                     margin_scale=float(args.sel_margin_scale),
                     weight_min=float(args.sel_weight_min),
                     weight_max=float(args.sel_weight_max),
@@ -2158,13 +2354,8 @@ def main():
             sel_model = MLP(sel_in_dim, args.hidden_dim, dropout_used, out_dim=len(rag_pool_ds))
 
             fallback_best_constant_expert, avg_utility_by_expert = compute_constant_fallback_expert(
-                cfg,
-                dataset,
-                rows,
-                idx_rag,
-                rag_pool_ds,
-                use_tradeoff=bool(args.tradeoff_mode),
-                tcfg=tcfg,
+                cfg, dataset, rows, idx_rag, rag_pool_ds,
+                use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
             )
 
             use_constant_selector = False
@@ -2172,81 +2363,90 @@ def main():
             best_model_val_argmax_u = None
             best_model_val_exp_u = None
             val_best_constant_expert = fallback_best_constant_expert
+            anchor_expert = None
 
             if args.selector_objective == "expected_u":
                 sel_model, sel_info = train_selector_expected_utility(
-                    sel_model,
-                    Xg,
-                    U_targets,
-                    device=args.device,
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                    batch_size=args.batch_size,
-                    epochs=args.epochs,
-                    patience=args.patience,
-                    min_delta=args.min_delta,
-                    seed=args.seed,
-                    min_val=args.min_val_selector,
+                    sel_model, Xg, U_targets,
+                    device=args.device, lr=args.lr, weight_decay=args.weight_decay,
+                    batch_size=args.batch_size, epochs=args.epochs, patience=args.patience,
+                    min_delta=args.min_delta, seed=args.seed, min_val=args.min_val_selector,
                     balanced_sampler=bool(args.selector_balanced_sampler),
-                    reg_type=str(args.sel_reg_type),
-                    reg_weight=float(args.sel_reg_weight),
-                    prior=prior,
-                    hard_labels_for_sampler=y_hard,
-                    example_weights=ex_w,
+                    reg_type=str(args.sel_reg_type), reg_weight=float(args.sel_reg_weight),
+                    prior=prior, hard_labels_for_sampler=y_hard, example_weights=ex_w,
                 )
                 best_score = float(sel_info["best_val_argmax_u"])
                 best_constant_val_u = float(sel_info["best_constant_val_u"])
                 best_model_val_argmax_u = float(sel_info["best_val_argmax_u"])
                 best_model_val_exp_u = float(sel_info["best_val_exp_u"])
                 val_best_constant_expert = rag_pool_ds[int(sel_info["best_constant_expert_idx"])]
-            else:
-                y_soft = build_selector_soft_targets(
-                    cfg,
-                    dataset,
-                    rows,
-                    idx_rag_f,
-                    rag_pool_ds,
-                    tau=args.sel_tau,
-                    use_tradeoff=bool(args.tradeoff_mode),
-                    tcfg=tcfg,
-                )
-                sel_model, best_score = train_selector_soft(
-                    sel_model,
-                    Xg,
-                    y_soft,
-                    device=args.device,
-                    lr=args.lr,
-                    weight_decay=args.weight_decay,
-                    batch_size=args.batch_size,
-                    epochs=args.epochs,
-                    patience=args.patience,
-                    min_delta=args.min_delta,
-                    seed=args.seed,
-                    min_val=args.min_val_selector,
+
+            elif args.selector_objective == "hard_ce":
+                sel_model, sel_info = train_selector_hard_ce(
+                    sel_model, Xg, y_hard, U_targets,
+                    device=args.device, lr=args.lr, weight_decay=args.weight_decay,
+                    batch_size=args.batch_size, epochs=args.epochs, patience=args.patience,
+                    min_delta=args.min_delta, seed=args.seed, min_val=args.min_val_selector,
                     balanced_sampler=bool(args.selector_balanced_sampler),
-                    reg_type=str(args.sel_reg_type),
-                    reg_weight=float(args.sel_reg_weight),
-                    prior=prior,
-                    hard_labels_for_sampler=y_hard,
                     example_weights=ex_w,
                 )
+                best_score = float(sel_info["best_val_argmax_u"])
+                best_constant_val_u = float(sel_info["best_constant_val_u"])
+                best_model_val_argmax_u = float(sel_info["best_val_argmax_u"])
+                best_model_val_exp_u = None
+                val_best_constant_expert = rag_pool_ds[int(sel_info["best_constant_expert_idx"])]
+
+            elif args.selector_objective == "delta_anchor":
+                anchor_expert = fallback_best_constant_expert
+                D_targets = build_selector_delta_anchor_matrix(
+                    cfg, dataset, rows, idx_rag_f, rag_pool_ds, anchor_expert,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
+                )
+
+                if args.print_target_stats:
+                    print(f"[{dataset}] selector_rag delta-anchor expert: {anchor_expert}")
+
+                sel_model, sel_info = train_selector_delta_anchor(
+                    sel_model, Xg, D_targets, U_targets,
+                    device=args.device, lr=args.lr, weight_decay=args.weight_decay,
+                    batch_size=args.batch_size, epochs=args.epochs, patience=args.patience,
+                    min_delta=args.min_delta, seed=args.seed, min_val=args.min_val_selector,
+                    example_weights=ex_w,
+                )
+                best_score = float(sel_info["best_val_argmax_u"])
+                best_constant_val_u = float(sel_info["best_constant_val_u"])
+                best_model_val_argmax_u = float(sel_info["best_val_argmax_u"])
+                best_model_val_exp_u = None
+                val_best_constant_expert = rag_pool_ds[int(sel_info["best_constant_expert_idx"])]
+
+            else:
+                y_soft = build_selector_soft_targets(
+                    cfg, dataset, rows, idx_rag_f, rag_pool_ds,
+                    tau=args.sel_tau, use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
+                )
+                sel_model, sel_info = train_selector_soft(
+                    sel_model, Xg, y_soft, U_targets,
+                    device=args.device, lr=args.lr, weight_decay=args.weight_decay,
+                    batch_size=args.batch_size, epochs=args.epochs, patience=args.patience,
+                    min_delta=args.min_delta, seed=args.seed, min_val=args.min_val_selector,
+                    balanced_sampler=bool(args.selector_balanced_sampler),
+                    reg_type=str(args.sel_reg_type), reg_weight=float(args.sel_reg_weight),
+                    prior=prior, hard_labels_for_sampler=y_hard, example_weights=ex_w,
+                )
+                best_score = float(sel_info["best_val_argmax_u"])
+                best_constant_val_u = float(sel_info["best_constant_val_u"])
+                best_model_val_argmax_u = float(sel_info["best_val_argmax_u"])
+                best_model_val_exp_u = None
+                val_best_constant_expert = rag_pool_ds[int(sel_info["best_constant_expert_idx"])]
 
             X_full = X_sel_all[idx_rag]
             U_full = build_selector_utility_matrix(
-                cfg,
-                dataset,
-                rows,
-                idx_rag,
-                rag_pool_ds,
-                use_tradeoff=bool(args.tradeoff_mode),
-                tcfg=tcfg,
+                cfg, dataset, rows, idx_rag, rag_pool_ds,
+                use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
             )
             full_model_argmax_u = selector_hard_utility_score(
-                sel_model,
-                X_full,
-                U_full,
-                device=args.device,
-                batch_size=max(256, int(args.batch_size)),
+                sel_model, X_full, U_full,
+                device=args.device, batch_size=max(256, int(args.batch_size))
             )
             full_constant_u = float(avg_utility_by_expert.get(fallback_best_constant_expert, 0.0))
             use_constant_selector = bool(full_constant_u >= (full_model_argmax_u - float(args.selector_constant_margin)))
@@ -2273,6 +2473,7 @@ def main():
                 "feature_keys": selector_feature_keys,
                 "sel_tau": float(args.sel_tau),
                 "selector_objective": str(args.selector_objective),
+                "anchor_expert": str(anchor_expert) if anchor_expert is not None else None,
                 "trained_on_gate_delta": float(args.gate_delta),
                 "trained_on_sel_margin_min": float(args.sel_margin_min),
                 "trained_on_sel_margin_max": float(args.sel_margin_max),
@@ -2315,13 +2516,8 @@ def main():
         if pol is None:
             if len(no_pool_ds) <= 1:
                 const_expert, avg_utility_by_expert = compute_constant_fallback_expert(
-                    cfg,
-                    dataset,
-                    rows,
-                    idx_no,
-                    no_pool_ds,
-                    use_tradeoff=bool(args.tradeoff_mode),
-                    tcfg=tcfg,
+                    cfg, dataset, rows, idx_no, no_pool_ds,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
                 )
                 print(f"[{dataset}] selector_no_rag is trivial (only one expert: {no_pool_ds}); saving constant selector.")
                 save_trivial_selector_ckpt(
@@ -2354,23 +2550,12 @@ def main():
                     selector_constant_margin=float(args.selector_constant_margin),
                 )
                 print(f"[{dataset}] saved trivial selector_no_rag -> {sel_no_path}")
-            elif should_train_selector(
-                    len(idx_no_f),
-                    min_train=args.min_train_selector,
-                    min_val=args.min_val_selector,
-                    name="selector_no_rag",
-                    ds=dataset,
-            ):
-                Xg = X_sel_all[idx_no_f]
 
+            elif should_train_selector(len(idx_no_f), min_train=args.min_train_selector, min_val=args.min_val_selector, name="selector_no_rag", ds=dataset):
+                Xg = X_sel_all[idx_no_f]
                 U_targets = build_selector_utility_matrix(
-                    cfg,
-                    dataset,
-                    rows,
-                    idx_no_f,
-                    no_pool_ds,
-                    use_tradeoff=bool(args.tradeoff_mode),
-                    tcfg=tcfg,
+                    cfg, dataset, rows, idx_no_f, no_pool_ds,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
                 )
                 y_hard = U_targets.argmax(dim=1).long()
 
@@ -2389,13 +2574,8 @@ def main():
                 ex_w = None
                 if args.sel_use_margin_weighting:
                     ex_w = selector_margin_weights(
-                        cfg,
-                        dataset,
-                        rows,
-                        idx_no_f,
-                        no_pool_ds,
-                        use_tradeoff=bool(args.tradeoff_mode),
-                        tcfg=tcfg,
+                        cfg, dataset, rows, idx_no_f, no_pool_ds,
+                        use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg,
                         margin_scale=float(args.sel_margin_scale),
                         weight_min=float(args.sel_weight_min),
                         weight_max=float(args.sel_weight_max),
@@ -2405,13 +2585,8 @@ def main():
                 sel_model = MLP(sel_in_dim, args.hidden_dim, dropout_used, out_dim=len(no_pool_ds))
 
                 fallback_best_constant_expert, avg_utility_by_expert = compute_constant_fallback_expert(
-                    cfg,
-                    dataset,
-                    rows,
-                    idx_no,
-                    no_pool_ds,
-                    use_tradeoff=bool(args.tradeoff_mode),
-                    tcfg=tcfg,
+                    cfg, dataset, rows, idx_no, no_pool_ds,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
                 )
 
                 use_constant_selector = False
@@ -2419,81 +2594,90 @@ def main():
                 best_model_val_argmax_u = None
                 best_model_val_exp_u = None
                 val_best_constant_expert = fallback_best_constant_expert
+                anchor_expert = None
 
                 if args.selector_objective == "expected_u":
                     sel_model, sel_info = train_selector_expected_utility(
-                        sel_model,
-                        Xg,
-                        U_targets,
-                        device=args.device,
-                        lr=args.lr,
-                        weight_decay=args.weight_decay,
-                        batch_size=args.batch_size,
-                        epochs=args.epochs,
-                        patience=args.patience,
-                        min_delta=args.min_delta,
-                        seed=args.seed,
-                        min_val=args.min_val_selector,
+                        sel_model, Xg, U_targets,
+                        device=args.device, lr=args.lr, weight_decay=args.weight_decay,
+                        batch_size=args.batch_size, epochs=args.epochs, patience=args.patience,
+                        min_delta=args.min_delta, seed=args.seed, min_val=args.min_val_selector,
                         balanced_sampler=bool(args.selector_balanced_sampler),
-                        reg_type=str(args.sel_reg_type),
-                        reg_weight=float(args.sel_reg_weight),
-                        prior=prior,
-                        hard_labels_for_sampler=y_hard,
-                        example_weights=ex_w,
+                        reg_type=str(args.sel_reg_type), reg_weight=float(args.sel_reg_weight),
+                        prior=prior, hard_labels_for_sampler=y_hard, example_weights=ex_w,
                     )
                     best_score = float(sel_info["best_val_argmax_u"])
                     best_constant_val_u = float(sel_info["best_constant_val_u"])
                     best_model_val_argmax_u = float(sel_info["best_val_argmax_u"])
                     best_model_val_exp_u = float(sel_info["best_val_exp_u"])
                     val_best_constant_expert = no_pool_ds[int(sel_info["best_constant_expert_idx"])]
-                else:
-                    y_soft = build_selector_soft_targets(
-                        cfg,
-                        dataset,
-                        rows,
-                        idx_no_f,
-                        no_pool_ds,
-                        tau=args.sel_tau,
-                        use_tradeoff=bool(args.tradeoff_mode),
-                        tcfg=tcfg,
-                    )
-                    sel_model, best_score = train_selector_soft(
-                        sel_model,
-                        Xg,
-                        y_soft,
-                        device=args.device,
-                        lr=args.lr,
-                        weight_decay=args.weight_decay,
-                        batch_size=args.batch_size,
-                        epochs=args.epochs,
-                        patience=args.patience,
-                        min_delta=args.min_delta,
-                        seed=args.seed,
-                        min_val=args.min_val_selector,
+
+                elif args.selector_objective == "hard_ce":
+                    sel_model, sel_info = train_selector_hard_ce(
+                        sel_model, Xg, y_hard, U_targets,
+                        device=args.device, lr=args.lr, weight_decay=args.weight_decay,
+                        batch_size=args.batch_size, epochs=args.epochs, patience=args.patience,
+                        min_delta=args.min_delta, seed=args.seed, min_val=args.min_val_selector,
                         balanced_sampler=bool(args.selector_balanced_sampler),
-                        reg_type=str(args.sel_reg_type),
-                        reg_weight=float(args.sel_reg_weight),
-                        prior=prior,
-                        hard_labels_for_sampler=y_hard,
                         example_weights=ex_w,
                     )
+                    best_score = float(sel_info["best_val_argmax_u"])
+                    best_constant_val_u = float(sel_info["best_constant_val_u"])
+                    best_model_val_argmax_u = float(sel_info["best_val_argmax_u"])
+                    best_model_val_exp_u = None
+                    val_best_constant_expert = no_pool_ds[int(sel_info["best_constant_expert_idx"])]
+
+                elif args.selector_objective == "delta_anchor":
+                    anchor_expert = fallback_best_constant_expert
+                    D_targets = build_selector_delta_anchor_matrix(
+                        cfg, dataset, rows, idx_no_f, no_pool_ds, anchor_expert,
+                        use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
+                    )
+
+                    if args.print_target_stats:
+                        print(f"[{dataset}] selector_no_rag delta-anchor expert: {anchor_expert}")
+
+                    sel_model, sel_info = train_selector_delta_anchor(
+                        sel_model, Xg, D_targets, U_targets,
+                        device=args.device, lr=args.lr, weight_decay=args.weight_decay,
+                        batch_size=args.batch_size, epochs=args.epochs, patience=args.patience,
+                        min_delta=args.min_delta, seed=args.seed, min_val=args.min_val_selector,
+                        example_weights=ex_w,
+                    )
+                    best_score = float(sel_info["best_val_argmax_u"])
+                    best_constant_val_u = float(sel_info["best_constant_val_u"])
+                    best_model_val_argmax_u = float(sel_info["best_val_argmax_u"])
+                    best_model_val_exp_u = None
+                    val_best_constant_expert = no_pool_ds[int(sel_info["best_constant_expert_idx"])]
+
+                else:
+                    y_soft = build_selector_soft_targets(
+                        cfg, dataset, rows, idx_no_f, no_pool_ds,
+                        tau=args.sel_tau, use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
+                    )
+                    sel_model, sel_info = train_selector_soft(
+                        sel_model, Xg, y_soft, U_targets,
+                        device=args.device, lr=args.lr, weight_decay=args.weight_decay,
+                        batch_size=args.batch_size, epochs=args.epochs, patience=args.patience,
+                        min_delta=args.min_delta, seed=args.seed, min_val=args.min_val_selector,
+                        balanced_sampler=bool(args.selector_balanced_sampler),
+                        reg_type=str(args.sel_reg_type), reg_weight=float(args.sel_reg_weight),
+                        prior=prior, hard_labels_for_sampler=y_hard, example_weights=ex_w,
+                    )
+                    best_score = float(sel_info["best_val_argmax_u"])
+                    best_constant_val_u = float(sel_info["best_constant_val_u"])
+                    best_model_val_argmax_u = float(sel_info["best_val_argmax_u"])
+                    best_model_val_exp_u = None
+                    val_best_constant_expert = no_pool_ds[int(sel_info["best_constant_expert_idx"])]
 
                 X_full = X_sel_all[idx_no]
                 U_full = build_selector_utility_matrix(
-                    cfg,
-                    dataset,
-                    rows,
-                    idx_no,
-                    no_pool_ds,
-                    use_tradeoff=bool(args.tradeoff_mode),
-                    tcfg=tcfg,
+                    cfg, dataset, rows, idx_no, no_pool_ds,
+                    use_tradeoff=bool(args.tradeoff_mode), tcfg=tcfg
                 )
                 full_model_argmax_u = selector_hard_utility_score(
-                    sel_model,
-                    X_full,
-                    U_full,
-                    device=args.device,
-                    batch_size=max(256, int(args.batch_size)),
+                    sel_model, X_full, U_full,
+                    device=args.device, batch_size=max(256, int(args.batch_size))
                 )
                 full_constant_u = float(avg_utility_by_expert.get(fallback_best_constant_expert, 0.0))
                 use_constant_selector = bool(full_constant_u >= (full_model_argmax_u - float(args.selector_constant_margin)))
@@ -2520,6 +2704,7 @@ def main():
                     "feature_keys": selector_feature_keys,
                     "sel_tau": float(args.sel_tau),
                     "selector_objective": str(args.selector_objective),
+                    "anchor_expert": str(anchor_expert) if anchor_expert is not None else None,
                     "trained_on_gate_delta": float(args.gate_delta),
                     "trained_on_sel_margin_min": float(args.sel_margin_min),
                     "trained_on_sel_margin_max": float(args.sel_margin_max),
