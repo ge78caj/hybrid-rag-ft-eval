@@ -210,9 +210,9 @@ def _top2_margin_in_pool(
 
 def policy_for_dataset(dataset: str, *, pubmed_policy_mode: str = "none") -> Optional[bool]:
     #if dataset in ("hotpotqa", "squad_v2"):
-     #   return True
+    #   return True
     #if dataset == "pubmedqa_v2":
-     #   return True if pubmed_policy_mode == "forced" else None
+    #   return True if pubmed_policy_mode == "forced" else None
     return None
 
 

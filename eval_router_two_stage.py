@@ -1,4 +1,5 @@
-﻿import argparse
+﻿#eval_router_two_stage.py
+import argparse
 import json
 import re
 from pathlib import Path
@@ -128,9 +129,9 @@ def should_use_shared_gate_for_dataset(ds: str) -> bool:
 
 def policy_for_dataset(dataset: str, *, pubmed_policy: str) -> Optional[bool]:
     #if dataset in ("hotpotqa", "squad_v2"):
-     #   return True
+    #   return True
     #if dataset == "pubmedqa_v2":
-     #   return True if pubmed_policy == "forced" else None
+    #   return True if pubmed_policy == "forced" else None
     return None
 
 
@@ -844,12 +845,12 @@ def run_eval_dataset(
                     with torch.no_grad():
                         logits = sm(xi.unsqueeze(0))[0]
                         selector_objective = str(sel_rag["raw_ckpt"].get("selector_objective", ""))
-                        
+
                         if selector_objective == "delta_anchor":
                             scores = logits
                             cls = int(torch.argmax(scores).item())
                             chosen_expert = experts[cls]
-                        
+
                             probs = torch.softmax(logits, dim=0)  # diagnostics only
                         else:
                             probs = torch.softmax(logits, dim=0)
@@ -883,12 +884,12 @@ def run_eval_dataset(
                         with torch.no_grad():
                             logits = sm(xi.unsqueeze(0))[0]
                             selector_objective = str(sel_rag["raw_ckpt"].get("selector_objective", ""))
-                            
+
                             if selector_objective == "delta_anchor":
                                 scores = logits
                                 cls = int(torch.argmax(scores).item())
                                 chosen_expert = experts[cls]
-                            
+
                                 probs = torch.softmax(logits, dim=0)  # diagnostics only
                             else:
                                 probs = torch.softmax(logits, dim=0)

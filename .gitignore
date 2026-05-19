@@ -1,16 +1,59 @@
 .env
 methods/multi_lora/*.joblib
+prediction/features_uncertainty.jsonl
+prediction/features_retrieval_preview.jsonl
+
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Experiment outputs
+results/
+outputs/
+checkpoints/
+runs/
+wandb/
+
+# Temporary / cache
+cache/
+tmp/
+*.tmp
+
+# Model / tensor artifacts
 *.pt
+*.pth
 *.ckpt
 *.bin
 *.safetensors
-.ipynb_checkpoints/
-.idea/
-.vscode/
-.DS_Store
-Thumbs.db
 
-prediction/features_uncertainty.jsonl
-prediction/features_retrieval_preview.jsonl
+# Local secrets / env
+.env
+.env.*
+secrets.json
+
+# Optional: generated router artifacts inside prediction
+prediction/features_*.jsonl
+prediction/router_train_*.jsonl
+
+# Optional: if prediction contains large local-only outputs
+# prediction/*.jsonl
+# prediction/*.json
